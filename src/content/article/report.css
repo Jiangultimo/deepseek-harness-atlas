@@ -1,0 +1,233 @@
+/*
+ * 长文《架构解剖》的排版。它原本是一份独立产出的整页文档，样式随正文一起搬进来，
+ * 选择器统一限定在 .dsh-report 之下——里面有 p、h1、table、figure 这类元素选择器，
+ * 不限定会污染整站。
+ *
+ * 颜色 token 在 globals.css 里，这里只声明文章独有的几个变量。
+ * 正文的字体、字号、行高继承自全站 body，文章不再自带一套。
+ *
+ * 依赖外部变量 --doc-topbar：页面顶栏的高度，由 report/page.tsx 声明。
+ * 窄屏下章节条要吸附在顶栏正下方，锚点跳转也要按它让开位置。
+ */
+
+.dsh-report {
+  --doc-f-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --doc-f-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --doc-measure: 40em;
+  --doc-rail: 208px;
+}
+.dsh-report * { box-sizing: border-box; }
+.dsh-report .wrap {
+  display: grid; grid-template-columns: var(--doc-rail) minmax(0, 1fr);
+  gap: 56px; max-width: 1080px; margin: 0 auto; padding: 0 32px 120px;
+}
+.dsh-report .rail-inner {
+  position: sticky; top: 0; padding: 40px 0;
+  display: flex; flex-direction: column; gap: 20px;
+  max-height: 100vh; overflow-y: auto;
+}
+.dsh-report .rail-mark {
+  font-family: var(--doc-f-mono); font-size: 11px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--doc-accent);
+  border-left: 2px solid var(--doc-accent); padding-left: 10px; line-height: 1.5;
+}
+.dsh-report .rail nav { display: flex; flex-direction: column; gap: 1px; }
+.dsh-report .rail nav a {
+  font-size: 13.5px; color: var(--doc-ink-mute); text-decoration: none;
+  padding: 3px 0 3px 11px; border-left: 2px solid var(--doc-line-soft);
+  transition: color .15s, border-color .15s;
+}
+.dsh-report .rail nav a:hover, .dsh-report .rail nav a:focus-visible { color: var(--doc-accent); border-left-color: var(--doc-accent); }
+.dsh-report main { min-width: 0; padding-top: 40px; }
+.dsh-report header.top { padding: 40px 0 32px; border-bottom: 1px solid var(--doc-line); }
+.dsh-report .eyebrow {
+  font-family: var(--doc-f-mono); font-size: 11.5px; letter-spacing: .16em;
+  text-transform: uppercase; color: var(--doc-ink-mute); margin: 0 0 16px;
+}
+.dsh-report h1 {
+  font-size: clamp(31px, 5vw, 44px); line-height: 1.14; letter-spacing: -.024em;
+  font-weight: 660; margin: 0 0 18px; text-wrap: balance;
+}
+.dsh-report .standfirst { font-size: 18px; line-height: 1.68; color: var(--doc-ink-2); max-width: var(--doc-measure); margin: 0; }
+.dsh-report h2 { font-size: 25px; letter-spacing: -.017em; font-weight: 640; line-height: 1.25; margin: 0; text-wrap: balance; }
+.dsh-report h3 { font-size: 18px; letter-spacing: -.008em; font-weight: 640; margin: 0 0 10px; text-wrap: balance; }
+.dsh-report section { padding-top: 54px; scroll-margin-top: calc(var(--doc-topbar) + 12px); }
+.dsh-report .sec-head {
+  display: flex; align-items: baseline; gap: 14px;
+  margin-bottom: 22px; padding-bottom: 12px; border-bottom: 1px solid var(--doc-line);
+}
+.dsh-report .sec-num { font-family: var(--doc-f-mono); font-size: 12px; color: var(--doc-accent); letter-spacing: .08em; flex: none; }
+.dsh-report p { max-width: var(--doc-measure); margin: 0 0 16px; }
+.dsh-report ul, .dsh-report ol { max-width: var(--doc-measure); margin: 0 0 16px; padding-left: 22px; }
+.dsh-report li { margin-bottom: 9px; }
+.dsh-report li::marker { color: var(--doc-ink-mute); }
+.dsh-report strong { font-weight: 640; color: var(--doc-ink); }
+.dsh-report em { font-style: normal; color: var(--doc-accent-ink); }
+.dsh-report a { color: var(--doc-accent); }
+.dsh-report code { font-family: var(--doc-f-mono); font-size: .86em; background: var(--doc-surface); border: 1px solid var(--doc-line-soft); border-radius: 3px; padding: .08em .34em; }
+/* pattern block */
+.dsh-report .pat { border: 1px solid var(--doc-line); margin: 0 0 22px; }
+.dsh-report .pat > h3 { margin: 0; padding: 14px 20px 12px; border-bottom: 1px solid var(--doc-line-soft); background: var(--doc-surface); }
+.dsh-report .pat .row { display: grid; grid-template-columns: 74px minmax(0,1fr); gap: 0; border-bottom: 1px solid var(--doc-line-soft); }
+.dsh-report .pat .row:last-child { border-bottom: none; }
+.dsh-report .pat .lbl {
+  font-family: var(--doc-f-mono); font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase;
+  color: var(--doc-ink-mute); padding: 15px 0 15px 20px; font-weight: 600; line-height: 1.9;
+}
+.dsh-report .pat .row.why .lbl { color: var(--doc-accent); }
+.dsh-report .pat .bd { padding: 13px 20px 13px 4px; }
+.dsh-report .pat .bd p { margin: 0 0 10px; max-width: 34em; }
+.dsh-report .pat .bd p:last-child { margin-bottom: 0; }
+.dsh-report .pat .bd ul { margin: 0; max-width: 34em; }
+.dsh-report .analogy {
+  border-left: 3px solid var(--doc-accent); background: var(--doc-accent-wash);
+  padding: 13px 18px; margin: 0 0 18px; max-width: var(--doc-measure);
+  font-size: 15.5px;
+}
+.dsh-report .analogy p { margin: 0; max-width: none; }
+.dsh-report .analogy b { font-family: var(--doc-f-mono); font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase; color: var(--doc-accent-ink); display: block; margin-bottom: 5px; font-weight: 600; }
+.dsh-report .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(124px, 1fr)); gap: 1px; background: var(--doc-line); border: 1px solid var(--doc-line); margin: 26px 0 10px; }
+.dsh-report .stat { background: var(--doc-ground); padding: 14px 16px; }
+.dsh-report .stat b { display: block; font-size: 25px; font-weight: 640; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.15; }
+.dsh-report .stat span { display: block; font-family: var(--doc-f-mono); font-size: 10.5px; letter-spacing: .07em; text-transform: uppercase; color: var(--doc-ink-mute); margin-top: 5px; }
+.dsh-report .tw { overflow-x: auto; margin: 0 0 20px; border: 1px solid var(--doc-line); --doc-scroll-bg: var(--doc-ground); }
+/* 窄屏放不下的东西只能横向滚，边缘阴影是唯一的可滚提示。
+   实色层跟着内容走（background-attachment: local），滚到尽头正好把阴影盖住，
+   内容不溢出时两端都盖着，所以桌面上不用另行关掉。
+   每个容器只需声明自己的底色 --doc-scroll-bg。 */
+.dsh-report .tw, .dsh-report .fig-wrap, .dsh-report .rail nav {
+  background-image:
+    linear-gradient(to right, var(--doc-scroll-bg), transparent),
+    linear-gradient(to left, var(--doc-scroll-bg), transparent),
+    radial-gradient(farthest-side at 0 50%, rgba(15, 21, 24, .13), transparent),
+    radial-gradient(farthest-side at 100% 50%, rgba(15, 21, 24, .13), transparent);
+  background-repeat: no-repeat;
+  background-position: 0 0, 100% 0, 0 0, 100% 0;
+  background-size: 30px 100%, 30px 100%, 12px 100%, 12px 100%;
+  background-attachment: local, local, scroll, scroll;
+}
+.dsh-report table { border-collapse: collapse; width: 100%; font-size: 14.5px; min-width: 420px; }
+.dsh-report th, .dsh-report td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--doc-line-soft); vertical-align: top; }
+.dsh-report th { font-family: var(--doc-f-mono); font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: var(--doc-ink-mute); font-weight: 600; background: var(--doc-surface); border-bottom: 1px solid var(--doc-line); }
+.dsh-report tr:last-child td { border-bottom: none; }
+.dsh-report td.num { font-family: var(--doc-f-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.dsh-report .note { border: 1px solid var(--doc-line); border-left: 3px solid var(--doc-accent); background: var(--doc-surface); padding: 16px 20px; margin: 0 0 20px; max-width: var(--doc-measure); }
+.dsh-report .note.warn { border-left-color: var(--doc-warn); background: var(--doc-warn-wash); }
+.dsh-report .note.crit { border-left-color: var(--doc-crit); background: var(--doc-crit-wash); }
+.dsh-report .note p:last-child { margin-bottom: 0; }
+.dsh-report .note h4 { font-size: 15.5px; font-weight: 640; margin: 0 0 8px; }
+.dsh-report .tier { margin-bottom: 32px; }
+.dsh-report .tier-label { display: flex; align-items: baseline; gap: 11px; margin-bottom: 13px; flex-wrap: wrap; }
+.dsh-report .tier-tag { font-family: var(--doc-f-mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; padding: 3px 9px; font-weight: 600; }
+.dsh-report .t-a { background: var(--doc-accent); color: var(--doc-ground); }
+.dsh-report .t-b { background: var(--doc-warn-wash); color: var(--doc-warn); border: 1px solid var(--doc-warn); }
+.dsh-report .t-c { background: var(--doc-crit-wash); color: var(--doc-crit); border: 1px solid var(--doc-crit); }
+.dsh-report .tier-label span.d { font-size: 14px; color: var(--doc-ink-mute); }
+.dsh-report .steal { border: 1px solid var(--doc-line); }
+.dsh-report .steal > div { padding: 14px 18px; border-bottom: 1px solid var(--doc-line-soft); }
+.dsh-report .steal > div:last-child { border-bottom: none; }
+.dsh-report .steal b { display: block; margin-bottom: 4px; font-weight: 640; }
+.dsh-report .steal p { margin: 0; font-size: 14.5px; color: var(--doc-ink-2); max-width: none; line-height: 1.7; }
+/* diagrams */
+.dsh-report figure { margin: 0 0 26px; }
+.dsh-report .fig-wrap {
+  border: 1px solid var(--doc-line); padding: 20px 16px 14px; overflow-x: auto;
+  background-color: var(--doc-surface); --doc-scroll-bg: var(--doc-surface);
+}
+.dsh-report figure svg { display: block; width: 100%; height: auto; min-width: 700px; color: var(--doc-ink-2); }
+.dsh-report figcaption { font-size: 13.5px; color: var(--doc-ink-mute); margin-top: 11px; max-width: var(--doc-measure); line-height: 1.68; }
+.dsh-report .d-box { fill: var(--doc-ground); stroke: currentColor; stroke-width: 1.1; }
+.dsh-report .d-box-a { fill: var(--doc-accent-wash); stroke: var(--doc-accent); stroke-width: 1.5; }
+.dsh-report .d-t { fill: var(--doc-ink); font-family: var(--doc-f-sans); font-size: 13px; }
+.dsh-report .d-t-a { fill: var(--doc-accent-ink); font-family: var(--doc-f-sans); font-size: 13px; font-weight: 640; }
+.dsh-report .d-s { fill: var(--doc-ink-mute); font-family: var(--doc-f-sans); font-size: 11px; }
+.dsh-report .d-m { fill: var(--doc-ink-mute); font-family: var(--doc-f-mono); font-size: 10px; letter-spacing: .02em; }
+.dsh-report .d-hd { fill: var(--doc-ink-mute); font-family: var(--doc-f-mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; }
+.dsh-report .d-l { stroke: currentColor; stroke-width: 1.1; fill: none; }
+.dsh-report .d-l-a { stroke: var(--doc-accent); stroke-width: 1.4; fill: none; }
+.dsh-report .d-ah { fill: currentColor; }
+.dsh-report .d-ah-a { fill: var(--doc-accent); }
+.dsh-report .flow { counter-reset: step; margin: 0 0 20px; max-width: var(--doc-measure); padding-left: 0; }
+.dsh-report .flow > li { list-style: none; position: relative; padding-left: 36px; margin-bottom: 13px; }
+.dsh-report .flow > li::before {
+  counter-increment: step; content: counter(step);
+  position: absolute; left: 0; top: 4px;
+  font-family: var(--doc-f-mono); font-size: 11px;
+  width: 22px; height: 22px; display: grid; place-items: center;
+  border: 1px solid var(--doc-accent); color: var(--doc-accent); border-radius: 50%;
+}
+.dsh-report details.appx { border: 1px solid var(--doc-line); margin: 0 0 14px; }
+.dsh-report details.appx > summary { padding: 12px 18px; cursor: pointer; font-weight: 640; background: var(--doc-surface); font-size: 15px; }
+.dsh-report details.appx > summary:hover { color: var(--doc-accent); }
+.dsh-report details.appx > div { padding: 14px 18px; border-top: 1px solid var(--doc-line-soft); }
+.dsh-report details.appx p { font-size: 14px; }
+.dsh-report details.appx code { font-size: 12.5px; }
+.dsh-report footer { margin-top: 70px; padding-top: 24px; border-top: 1px solid var(--doc-line); font-size: 13.5px; color: var(--doc-ink-mute); max-width: var(--doc-measure); }
+.dsh-report :focus-visible { outline: 2px solid var(--doc-accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {.dsh-report * { transition: none !important; } }
+
+/* ── 窄到放不下侧栏 ──────────────────────────────────────
+ * 双栏压成单栏，侧边导轨改成吸附在顶栏下方的横向章节条。
+ * 这是全文唯一的跳转入口，直接隐藏会让十三节内容只能靠滚。
+ */
+@media (max-width: 900px) {
+.dsh-report .wrap { grid-template-columns: 1fr; gap: 0; padding: 0 20px 80px; }
+.dsh-report main { padding-top: 8px; }
+.dsh-report .pat .row { grid-template-columns: 1fr; }
+.dsh-report .pat .lbl { padding: 12px 20px 0; line-height: 1.5; }
+.dsh-report .pat .bd { padding: 6px 20px 14px; }
+
+/* 负边距让章节条横跨整个视口，左右留白由 nav 自己的 padding 补回来 */
+.dsh-report .rail {
+  position: sticky; top: var(--doc-topbar); z-index: 5;
+  margin: 0 -20px; background: var(--doc-ground);
+  border-bottom: 1px solid var(--doc-line);
+  min-width: 0;
+}
+/* 网格子项和弹性子项的 min-width 默认是 auto，会被十三个不换行的章节名撑开，
+   一路顶穿视口。这两处归零，横向滚动才落在 nav 自己身上。 */
+.dsh-report .rail-inner { position: static; padding: 0; max-height: none; overflow: visible; min-width: 0; }
+.dsh-report .rail-mark { display: none; }
+.dsh-report .rail nav {
+  flex-direction: row; gap: 0; padding: 0 20px;
+  overflow-x: auto; scrollbar-width: none;
+  --doc-scroll-bg: var(--doc-ground);
+}
+.dsh-report .rail nav::-webkit-scrollbar { display: none; }
+.dsh-report .rail nav a {
+  flex: none; white-space: nowrap; padding: 11px 13px 9px;
+  border-left: none; border-bottom: 2px solid transparent;
+}
+.dsh-report .rail nav a:first-child { padding-left: 0; }
+.dsh-report .rail nav a:hover, .dsh-report .rail nav a:focus-visible {
+  border-left-color: transparent; border-bottom-color: var(--doc-accent);
+}
+/* 顶栏和章节条两层都要让开 */
+.dsh-report section { scroll-margin-top: calc(var(--doc-topbar) + 52px); }
+}
+
+/* ── 手机 ────────────────────────────────────────────────
+ * 竖向节奏按屏高收一档：桌面上舒服的留白在这里全是滚动成本。
+ */
+@media (max-width: 640px) {
+.dsh-report .wrap { padding: 0 18px 64px; }
+.dsh-report .rail { margin: 0 -18px; }
+.dsh-report .rail nav { padding: 0 18px; }
+.dsh-report main { padding-top: 0; }
+.dsh-report header.top { padding: 28px 0 24px; }
+.dsh-report .eyebrow { margin: 0 0 12px; }
+.dsh-report h1 { margin: 0 0 14px; }
+.dsh-report .standfirst { font-size: 17px; }
+.dsh-report h2 { font-size: 22px; }
+.dsh-report section { padding-top: 40px; }
+.dsh-report .sec-head { gap: 11px; margin-bottom: 18px; padding-bottom: 10px; }
+.dsh-report .pat > h3 { padding: 12px 16px 10px; }
+.dsh-report .pat .lbl { padding: 12px 16px 0; }
+.dsh-report .pat .bd { padding: 6px 16px 13px; }
+.dsh-report .note, .dsh-report .analogy { padding: 13px 16px; }
+.dsh-report .steal > div { padding: 12px 16px; }
+.dsh-report details.appx > summary, .dsh-report details.appx > div { padding: 12px 16px; }
+.dsh-report .stat { padding: 12px 14px; }
+.dsh-report .fig-wrap { padding: 14px 12px 10px; }
+.dsh-report footer { margin-top: 48px; }
+}

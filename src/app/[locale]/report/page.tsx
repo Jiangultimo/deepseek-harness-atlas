@@ -1,6 +1,7 @@
 import Link from 'next/link'
 import type { Metadata } from 'next'
 import { notFound } from 'next/navigation'
+import '@/content/article/report.css'
 import reportZh from '@/content/article/report.zh.json'
 import reportEn from '@/content/article/report.en.json'
 import { type Locale, isLocale, ui } from '@/content/i18n'
@@ -19,9 +20,8 @@ export async function generateMetadata({
 }
 
 /**
- * 这篇长文原本是独立产出的分析报告，整篇搬进来。
- * 它自带一套排版样式，变量已全部加上 doc- 前缀并限定在容器内，
- * 所以不会和地图那套暖色 token 打架。
+ * 这篇长文原本是独立产出的分析报告，整篇搬进来。排版在 report.css，
+ * 选择器已限定在 .dsh-report 之下，不会和地图那套暖色 token 打架。
  */
 export default async function ReportPage({ params }: PageProps<'/[locale]/report'>) {
   const { locale } = await params
@@ -29,9 +29,10 @@ export default async function ReportPage({ params }: PageProps<'/[locale]/report
   const report = (locale as Locale) === 'en' ? reportEn : reportZh
 
   return (
-    <div className="min-h-dvh bg-doc-ground">
-      <div className="sticky top-0 z-20 border-b border-doc-line bg-doc-ground/90 backdrop-blur-md">
-        <div className="mx-auto flex max-w-[1100px] items-center gap-4 px-6 py-3.5">
+    // 顶栏高度定在这里：窄屏下文章的章节条要吸附在它正下方，report.css 读的是同一个变量。
+    <div className="min-h-dvh bg-doc-ground [--doc-topbar:56px]">
+      <div className="sticky top-0 z-20 h-[var(--doc-topbar)] border-b border-doc-line bg-doc-ground/90 backdrop-blur-md">
+        <div className="mx-auto flex h-full max-w-[1100px] items-center gap-4 px-6">
           <Link
             href={`/${locale}`}
             className="flex shrink-0 items-center gap-2 text-[13px] text-doc-ink-mute transition-colors hover:text-doc-accent"
@@ -52,40 +53,10 @@ export default async function ReportPage({ params }: PageProps<'/[locale]/report
         </div>
       </div>
 
-      <style dangerouslySetInnerHTML={{ __html: scopeStyle(report.style) }} />
       <div
         className="dsh-report"
         dangerouslySetInnerHTML={{ __html: report.body }}
       />
     </div>
   )
-}
-
-/**
- * 把原样式里的每条选择器限定到 .dsh-report 之下。
- * 报告里的 body / html 规则直接丢掉——它现在只是页面的一部分，不再是整页。
- */
-function scopeStyle(css: string): string {
-  return css
-    .split('}')
-    .map((chunk) => {
-      const i = chunk.indexOf('{')
-      if (i === -1) return chunk
-      const head = chunk.slice(0, i)
-      const rest = chunk.slice(i)
-      // @media / @supports 之类的块头原样保留
-      if (head.includes('@') || head.trim().startsWith(':root')) return chunk
-      const scoped = head
-        .split(',')
-        .map((sel) => {
-          const t = sel.trim()
-          if (!t) return sel
-          if (t === 'body' || t === 'html') return `.dsh-report`
-          if (t === '*') return `.dsh-report *`
-          return `.dsh-report ${t}`
-        })
-        .join(', ')
-      return scoped + rest
-    })
-    .join('}')
 }
