@@ -66,7 +66,7 @@ export function Lighthouse({ position, label, hint, toonMap, onOpen }: Props) {
     [],
   )
 
-  useFrame((state, delta) => {
+  useFrame((state) => {
     const t = state.clock.elapsedTime
 
     // 随浪轻轻起伏

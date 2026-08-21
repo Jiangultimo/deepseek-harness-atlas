@@ -6,7 +6,7 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import { Vector3 } from 'three'
 import type { Texture } from 'three'
-import type { EdgeKind, RegionId } from '@/content/types'
+import type { RegionId } from '@/content/types'
 import {
   BLOCKS,
   BLOCKS_BY_REGION,
@@ -32,7 +32,6 @@ export type View =
 interface SceneProps {
   view: View
   locale: Locale
-  hiddenKinds: Set<EdgeKind>
   linkedIds: Set<string>
   resetNonce: number
   signLabel: string
@@ -119,7 +118,7 @@ function CameraRig({
 
   const key =
     view.level === 'block' ? `b:${view.block}` : view.level === 'region' ? `r:${view.region}` : 'w'
-  const desired = useMemo(() => desiredFor(view), [key])
+  const desired = useMemo(() => desiredFor(view), [view])
 
   useEffect(() => {
     animating.current = true
@@ -257,7 +256,6 @@ function Sea() {
 export function Scene({
   view,
   locale,
-  hiddenKinds,
   linkedIds,
   resetNonce,
   signLabel,
@@ -335,7 +333,6 @@ export function Scene({
           <BlockRoads
             activeRegion={activeRegion}
             selectedId={selectedId}
-            hiddenKinds={hiddenKinds}
             onPick={onSelectBlock}
           />
         )}
@@ -348,7 +345,6 @@ export function Scene({
               block={block}
               locale={locale}
               selected={selectedId === block.id}
-              linked={linkedIds.has(block.id)}
               dimmed={selectedId !== null && selectedId !== block.id && !linkedIds.has(block.id)}
               toonMap={toonMap}
               onSelect={onSelectBlock}

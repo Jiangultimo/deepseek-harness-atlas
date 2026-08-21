@@ -6,17 +6,14 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import type { EdgeKind, RegionId } from '@/content/types'
 import {
-  BLOCKS,
   BLOCKS_BY_REGION,
   BLOCK_BY_ID,
   EDGES,
-  EDGE_KINDS,
   EDGE_KIND_BY_ID,
   REGIONS,
   REGION_BY_ID,
   REGION_EDGES,
 } from '@/content/map'
-import { highlightsOf } from '@/content/highlights'
 import { LOCALE_LABEL, LOCALES, type Locale, t, ui } from '@/content/i18n'
 import type { View } from './Scene'
 import { ArchivePanel } from './ArchivePanel'
@@ -33,7 +30,6 @@ const Scene = dynamic(() => import('./Scene').then((m) => m.Scene), {
 export function AtlasShell({ locale }: { locale: Locale }) {
   const [view, setView] = useState<View>({ level: 'world' })
   const [hoveredId, setHoveredId] = useState<string | null>(null)
-  const [hiddenKinds, setHiddenKinds] = useState<Set<EdgeKind>>(new Set())
   const [resetNonce, setResetNonce] = useState(0)
   /** 窄屏没有 3D，档案就地展开 */
   const [mobileOpen, setMobileOpen] = useState<string | null>(null)
@@ -65,27 +61,18 @@ export function AtlasShell({ locale }: { locale: Locale }) {
 
   const recenter = useCallback(() => setResetNonce((n) => n + 1), [])
 
-  const toggleKind = useCallback((kind: EdgeKind) => {
-    setHiddenKinds((prev) => {
-      const next = new Set(prev)
-      if (next.has(kind)) next.delete(kind)
-      else next.add(kind)
-      return next
-    })
-  }, [])
-
   const selectedId = view.level === 'block' ? view.block : null
   const activeRegion = view.level === 'world' ? null : view.region
 
   const { linkedIds, outgoing, incoming } = useMemo(() => {
     if (!selectedId) return { linkedIds: new Set<string>(), outgoing: [], incoming: [] }
-    const out = EDGES.filter((e) => e.from === selectedId && !hiddenKinds.has(e.kind))
-    const inc = EDGES.filter((e) => e.to === selectedId && !hiddenKinds.has(e.kind))
+    const out = EDGES.filter((e) => e.from === selectedId)
+    const inc = EDGES.filter((e) => e.to === selectedId)
     const ids = new Set<string>()
     out.forEach((e) => ids.add(e.to))
     inc.forEach((e) => ids.add(e.from))
     return { linkedIds: ids, outgoing: out, incoming: inc }
-  }, [selectedId, hiddenKinds])
+  }, [selectedId])
 
   const selected = selectedId ? BLOCK_BY_ID[selectedId] : null
   const hovered = hoveredId ? BLOCK_BY_ID[hoveredId] : null
@@ -96,7 +83,6 @@ export function AtlasShell({ locale }: { locale: Locale }) {
         <Scene
           view={view}
           locale={locale}
-          hiddenKinds={hiddenKinds}
           linkedIds={linkedIds}
           resetNonce={resetNonce}
           signLabel={ui('signLabel', locale)}

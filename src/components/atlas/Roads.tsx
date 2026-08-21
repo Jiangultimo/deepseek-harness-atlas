@@ -3,7 +3,7 @@
 import { useMemo } from 'react'
 import { Html, Line } from '@react-three/drei'
 import { Quaternion, Vector3 } from 'three'
-import type { Edge, EdgeKind, RegionId } from '@/content/types'
+import type { RegionId } from '@/content/types'
 import {
   BLOCK_BY_ID,
   EDGES,
@@ -104,11 +104,10 @@ export function RegionRoads({ onEnter }: { onEnter: (id: RegionId) => void }) {
 interface BlockRoadsProps {
   activeRegion: RegionId
   selectedId: string | null
-  hiddenKinds: Set<EdgeKind>
   onPick: (id: string) => void
 }
 
-export function BlockRoads({ activeRegion, selectedId, hiddenKinds, onPick }: BlockRoadsProps) {
+export function BlockRoads({ activeRegion, selectedId, onPick }: BlockRoadsProps) {
   const roads = useMemo(() => {
     const pair = new Map<string, number>()
     const relevant = EDGES.filter(
@@ -138,7 +137,6 @@ export function BlockRoads({ activeRegion, selectedId, hiddenKinds, onPick }: Bl
   return (
     <group>
       {roads.map(({ edge, built }, i) => {
-        if (hiddenKinds.has(edge.kind)) return null
         const meta = EDGE_KIND_BY_ID[edge.kind]
         const touches = selectedId === null || edge.from === selectedId || edge.to === selectedId
         const active = selectedId !== null && touches

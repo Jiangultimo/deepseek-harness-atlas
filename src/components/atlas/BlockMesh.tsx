@@ -13,7 +13,6 @@ interface Props {
   block: Block
   locale: Locale
   selected: boolean
-  linked: boolean
   dimmed: boolean
   toonMap: Texture
   onSelect: (id: string) => void
@@ -30,7 +29,6 @@ export function BlockMesh({
   block,
   locale,
   selected,
-  linked,
   dimmed,
   toonMap,
   onSelect,
