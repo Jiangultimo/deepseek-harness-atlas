@@ -9,48 +9,40 @@ import { Prose, inline } from '@/components/Prose'
 
 /**
  * 档案按需加载：22 份合计 8.7 万字，全部打进首屏太重。
- * 加载过的留在内存里，来回切换不重复请求。
+ * 缓存记录每个键的落地结果——档案本身，或表示取不到的 null——来回切换不重复请求。
+ * 取不到之后不再自动重试：界面给的指引就是刷新页面，重来一次的入口在那里。
  */
-const cache = new Map<string, Archive>()
+const cache = new Map<string, Archive | null>()
 
 const cacheKey = (id: string, locale: Locale) => `${locale}/${id}`
 
 function useArchive(id: string, locale: Locale) {
-  const [archive, setArchive] = useState<Archive | null>(() => cache.get(cacheKey(id, locale)) ?? null)
-  const [loading, setLoading] = useState(!cache.has(cacheKey(id, locale)))
-  const [failed, setFailed] = useState(false)
+  const key = cacheKey(id, locale)
+  // 缓存是唯一的事实来源，渲染期直接读它。这个 state 不存档案，只在请求落地后
+  // 触发一次重渲染——命中缓存时连这一次都不需要，也就不会有同步 setState 引发的级联渲染。
+  const [, markSettled] = useState(0)
 
   useEffect(() => {
-    const key = cacheKey(id, locale)
-    const hit = cache.get(key)
-    if (hit) {
-      setArchive(hit)
-      setLoading(false)
-      setFailed(false)
-      return
-    }
+    if (cache.has(key)) return
     let alive = true
-    setLoading(true)
-    setFailed(false)
     import(`@/content/archives/${locale}/${id}.json`)
       .then((mod) => {
-        if (!alive) return
-        const data = (mod.default ?? mod) as Archive
-        cache.set(key, data)
-        setArchive(data)
-        setLoading(false)
+        cache.set(key, (mod.default ?? mod) as Archive)
       })
       .catch(() => {
-        if (!alive) return
-        setFailed(true)
-        setLoading(false)
+        cache.set(key, null)
+      })
+      .finally(() => {
+        if (alive) markSettled((n) => n + 1)
       })
     return () => {
       alive = false
     }
-  }, [id, locale])
+  }, [key, id, locale])
 
-  return { archive, loading, failed }
+  const settled = cache.has(key)
+  const archive = cache.get(key) ?? null
+  return { archive, loading: !settled, failed: settled && archive === null }
 }
 
 interface Props {

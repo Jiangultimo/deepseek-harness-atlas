@@ -5,6 +5,7 @@ import type { ComponentRef } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import { Vector3 } from 'three'
+import type { Texture } from 'three'
 import type { EdgeKind, RegionId } from '@/content/types'
 import {
   BLOCKS,
@@ -212,20 +213,31 @@ function useKeyboard(view: View, onSelectBlock: (id: string) => void, onBack: ()
   }, [view, onSelectBlock, onBack])
 }
 
+interface SeaLayers {
+  near: Texture
+  far: Texture
+}
+
+function makeSeaLayers(): SeaLayers {
+  const far = makeSeaTexture()
+  far.repeat.set(5, 5)
+  return { near: makeSeaTexture(), far }
+}
+
 /** 海面：两层波纹以不同速度反向漂移，叠出「水在动」而不是贴图在滚 */
 function Sea() {
-  const near = useMemo(() => makeSeaTexture(), [])
-  const far = useMemo(() => {
-    const t = makeSeaTexture()
-    t.repeat.set(5, 5)
-    return t
-  }, [])
+  // 波纹靠每帧推 offset 得到，贴图因此是可变量，用 ref 持有。
+  // useMemo 的产物按约定不可写，写它会被静态规则拦下，改写行为也不受保护。
+  // 每个实例各造一份：组件卸载时 R3F 会连同贴图一起释放，共用一份再挂载就拿到已释放的资源。
+  const layersRef = useRef<SeaLayers | null>(null)
+  const layers = (layersRef.current ??= makeSeaLayers())
+  const { near, far } = layers
 
   useFrame((_, delta) => {
-    near.offset.x += delta * 0.004
-    near.offset.y -= delta * 0.0022
-    far.offset.x -= delta * 0.0026
-    far.offset.y += delta * 0.0015
+    layers.near.offset.x += delta * 0.004
+    layers.near.offset.y -= delta * 0.0022
+    layers.far.offset.x -= delta * 0.0026
+    layers.far.offset.y += delta * 0.0015
   })
 
   return (
@@ -257,7 +269,7 @@ export function Scene({
   onHover,
 }: SceneProps) {
   useKeyboard(view, onSelectBlock, onBack)
-  const toonMap = useMemo(makeToonGradient, [])
+  const toonMap = useMemo(() => makeToonGradient(), [])
 
   const activeRegion = view.level === 'world' ? null : view.region
   const selectedId = view.level === 'block' ? view.block : null
