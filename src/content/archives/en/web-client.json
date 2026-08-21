@@ -1,0 +1,219 @@
+{
+ "id": "web-client",
+ "lede": "When an agent that lives in a terminal grows a graphical interface, the first problem you hit isn't picking a framework — it's who gets to decide what the interface is. Thirty-one UI packages, each developed on its own, built on its own, each capable of breaking in any given build, and all of them have to fit into one window. Worse, the set is decided by configuration: nine installed today, fifteen tomorrow. The usual move is to write one big frontend app, pull every interface in statically at bundle time, and freeze the set right there. That's not what happens here. The first thing the page does on startup is parse a plugin manifest the server injected moments ago, then raise a plugin tree in the browser with the same shape as the host's. **The browser side isn't a frontend app. It's a second host for the same plugin container.**",
+ "packages": [
+  "packages/client/runtime",
+  "packages/client/ui-slots",
+  "packages/client/ui-conversation",
+  "packages/client/ui-layout",
+  "packages/client/web",
+  "packages/client/web-react",
+  "packages/client/modules",
+  "packages/client/connection",
+  "packages/host/webserver",
+  "packages/host/frontend-static",
+  "packages/host/apiproxy",
+  "packages/api/remotes"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "At startup the page doesn't know what it's supposed to load",
+   "body": [
+    "First, what \"plugin container\" means here, or the rest of this is jargon. Plugins hang on a tree, and each mount point has its own birth and death. Plugins never reference each other directly — they find each other through named services on a shared object. Every registration hands back, on the spot, the means to undo it. The rule across the whole repo is that everything is a plugin, and the browser side is no exception.",
+    "A frontend's composition is usually frozen the moment it's bundled. You write one entry point, pull every interface in statically, and who's in and who goes first are settled at build time.",
+    "But this agent's plugin set is a runtime fact — configuration decides it, and the agent can edit its own configuration. A set frozen at bundle time and the set the host actually has mounted right now will stop matching sooner or later.",
+    "So every time the server renders the index page, it drops a current plugin manifest into the head: one row per package — the name, where its code bundle lives, a content hash, and whether to prefetch it immediately at startup. The browser shell parses that manifest and loads them one by one. If the manifest is missing or malformed, it throws right there — no manifest, nothing to start.",
+    "The shell kernel references none of the UI packages. That's deliberate: the loading screen has to still render when every plugin is dead. The one exception is the module system itself — it can't be reached through itself, so it's bundled into the shell and, once the container is up, comes back to claim its own row.",
+    "**What the page boots with is the set the host has mounted right now, not a set frozen at bundle time.**",
+    "This sounds like a loading detail. It decides something much bigger: whether the agent can change its own interface while running — edit, refresh, done, instead of going through another build."
+   ]
+  },
+  {
+   "heading": "Silently stuck is worse than crashed",
+   "body": [
+    "Dependency injection has a bad habit that rarely gets named on its own: waiting has no timeout.",
+    "A plugin waiting on a service that will never arrive doesn't error, doesn't retry, doesn't exit. It just waits there. On screen this shows up as a missing piece, and you don't know which piece is missing, let alone why.",
+    "A crash is good news, because a crash comes with the scene of the accident. Quietly never starting is the bad news.",
+    "The usual move is to add a timeout, or not to check at all — the interface still looks usable, after all.",
+    "What happens here instead is a full physical forced in at the end of startup. Once every entry has been created and the whole tree has gone quiet, each one gets checked: no running instance means the download or the evaluation failed; stuck in pending means it's waiting on some service, so the name of that service gets listed verbatim; any other non-active state counts as a failure. One failing row and the interface never reaches the main view — it stays on the loading screen and spreads out who is waiting on what.",
+    "Startup itself is cut in two. The first half does two things in parallel: prefetch every code bundle the manifest marked for immediate loading, and install the loader with the module system injected straight into it — which has to happen before any entry exists, because a loader that doesn't get that injection falls back to the browser's native dynamic import, which here is guaranteed to fail. The second half waits for every prefetch to land before creating entries in a batch, because materializing an entry triggers synchronous cross-package references, and the container's dependency-waiting machinery doesn't protect that layer.",
+    "The interesting part is that an individual prefetch failure gets swallowed silently. The reason is practical: prefetch is only a speedup, and one broken bundle shouldn't blow up the whole startup before it has really begun; letting the later creation path load it again and fail loudly puts the error where it belongs.",
+    "**A silent failure has to be translated into a loud one, or it's no different from a bug nobody found.**"
+   ]
+  },
+  {
+   "heading": "Every place in the interface has to be declared first",
+   "body": [
+    "Thirty-one UI packages all want to put things into the same window, and they're forbidden from referencing each other — a direct cross-plugin reference counts as a build-purity error in this repo and gets stopped at the gate.",
+    "So how do they know where their stuff goes?",
+    "There are two usual answers. One is a central layout file everyone edits when they want to add something, which quickly becomes both a bottleneck and a source of conflicts. The other is agreeing on a few string mount points anyone can push into — no contract, so no validation, and eventually nobody can say what is actually sitting in any given spot.",
+    "This takes a third route: the place is itself a declared contract. Every spot in the interface where a component can go is declared explicitly by some plugin in a table of types, and other packages add rows to that table through declaration merging.",
+    "One registration does four things at once: contributes a component, declares which sub-places that component opens up inside itself, declares the state seat it takes, and declares its namespace for user-facing text. A place has two axes. Cardinality, one of four: exclusive, ordered list, dispatched by key, routed by selector. Scope, one of three: global, strictly bound to one session, or session-optional.",
+    "The shell itself renders exactly one built-in place. That three-column frame is something the layout package registered into it, opening four sub-places in the same call: sidebar, conversation, detail, overlay.",
+    "**What the interface looks like is itself a plugin registration, not a hardcoded stretch of the shell.**",
+    "Registration runs through the caller's own container effect, so unloading a plugin automatically revokes its registration and cascades away every sub-place it opened. A crash during render is caught by a boundary, and the report carries one extra fact: whether this crash made the registration step down from the slot it held so the next in priority could take over. When someone writes a broken UI plugin, what collapses is that one slot.",
+    "I've come to think the real cost of an extensible system isn't in how you add something. It's in how the added thing gets found, gets validated, and gets taken back out. Declaring the place as a contract settles all three at once."
+   ]
+  },
+  {
+   "heading": "A session needs a life and a death of its own",
+   "body": [
+    "Switching between sessions looks like a tiny feature. It's actually where interfaces like this leak most easily.",
+    "On screen a session isn't just a run of messages. It has its own input state machine, its own slash-command controller, its own popovers, its own pile of local state and persistence keys from every UI plugin. Switch away and all of that has to go with it; switch back and all of it has to grow again.",
+    "Miss one on cleanup and you've leaked. Clean too early and the user clicks back to find their stuff gone.",
+    "The usual move is one big table indexed by session id, where each component stores its own entry and cleans up after itself. Anything that runs on good intentions leaks eventually.",
+    "Here each session gets a small subtree of its own: an empty mount point plus a context label, where the session id doubles as that agent's identity. It's created lazily, and resolving it is pure — no side effects — so calling it during render is safe, and neither the view layer's double invocations nor discarded intermediate results leave anything dirty behind.",
+    "The lifecycle hangs on one fact: being on stage. The history window being open is what it means for a session to be on stage. A session that drops off the list is torn down immediately — except the one on stage, which freezes into a read-only view and is torn down only when the stage actually moves away.",
+    "That exception isn't politeness, it's necessary. Reconnects and list refreshes both make the current session vanish from the list for a moment; treat \"not in the list\" as \"tear it down\" and the thing you destroy is exactly the reason the frozen view exists.",
+    "Teardown goes all the way in one pass: the scoped subtree cascades away together with the input box, the command controller, the popovers, every plugin's state and listeners; state instances keyed by session are cleared along with their persisted keys — even a state that was never rendered gets materialized once, temporarily, purely so its key can be deleted; the session object itself goes last. The session log on the host is the durable truth, and next time it's opened everything is rebuilt lazily.",
+    "Binding the lifecycle to whether anyone is looking, rather than to some particular call site, buys something concrete: restoring at startup and coming back from a reconnect don't need separate code paths. Both reduce to the same sentence — who is standing on the stage right now."
+   ]
+  },
+  {
+   "heading": "Derived values get computed in exactly one place",
+   "body": [
+    "From the same session log, the host folds out a pile of derived values: the current model, token usage, todo progress, permission state. The browser wants to display those too.",
+    "Computing them on both sides is the most natural thing to write, and the beginning of drift.",
+    "The usual answers are either reimplementing the fold on the client, or extracting a shared library both sides use. The shared library is better, but it can only share code — it can't share which side saw which event first.",
+    "Here the computation is pulled into a single place: the host is the only one computing, and the client keeps just a table — each key mapped to a complete value plus a sequence number. There's one rule: if the sequence number isn't higher than what's already there, drop it.",
+    "The last page of history carries a baseline block as the seed, and pushed frames update it from there. A key absent from the baseline means that capability doesn't exist — clear the row, unless the existing row's number is newer than the baseline's cut point.",
+    "That single rule blocks three things at once: replayed frames, out-of-order frames, and state that outranks the host after a restart. On reconnect, if a key's number is ahead of the host's own durable baseline, it's riding on state the host lost when it restarted, so it gets truncated and thrown away.",
+    "The same fussiness shows up in the event window. Live events are deduplicated by sequence number, and when a number is skipped, the response isn't to patch the hole — it's to buffer the events and pull the last page again to repair. The window has to be one contiguous range, because the conversation rules need to be able to relate every record inside it.",
+    "**One monotonic rule, in place of three classes of fault-tolerance branches.**",
+    "The cost is that the host pushes more data. The payoff is that putting a new domain on screen takes zero client code — and drift between the two folds can't happen at the root, because there's no fold on the client at all."
+   ]
+  },
+  {
+   "heading": "Two ways to turn a log into a chat stream",
+   "body": [
+    "Turning a flat run of session events into a screen of structured chat, the tempting way to write it is one big branch table: take an event, look at its type, produce a bubble.",
+    "That version starts becoming a disaster around month three. Event types keep multiplying, and plenty of bubbles aren't one event each — one event opens them and a dozen more fill them in over time: streaming text, a tool call's arguments and results, the progress of a subtask.",
+    "The usual fix is to fold the whole thing from scratch every time, computing the entire log into a list of nodes. Correct, but slow — and worse, every node loses its identity, taking scroll position, animations, and expanded state down with it.",
+    "Here each kind of node is a separately registered definition: which events it claims, how it builds initial state from the opening event, how it eats each following event in turn, how it materializes state into a node to render. A definition can also declare its own publishing tempo — don't notify, per animation frame, or immediately, three settings, and the engine takes the maximum. Streaming output runs on animation frames; state jumps run immediately.",
+    "Each session has its own assembler instance holding the context table, two indexes — one by type, one by sequence number — a dirty set, and the dependency graph between definitions. There are only three ways in: replace everything (on open, on reconnect, after repairing a hole), append at the tail (without scanning existing contexts), and page backwards (guaranteeing existing nodes keep their identity).",
+    "There's one deliberate hard constraint: a node that has already been materialized may not be withdrawn. If the build goes from returning a node to returning nothing, the engine throws and demands you return the same key marked hidden instead. **Deletion is taken out of the incremental protocol entirely, and the price is one extra visibility field.**",
+    "Definitions may ask each other limited questions, but strictly backwards: when opening, one can look up its nearest predecessor of the same type by starting sequence number. That's how a user message decides whether it starts a new turn or was slipped into the turn already running. If the predecessor changes, the dependency graph replays whoever depended on it.",
+    "Rendering is a second, separate registration: the node type is the key, and each rendering component hangs by that key into a place that dispatches by key.",
+    "Registering the data side and the render side separately means a new conversation node can ship its data first and get its interface later, or have another package swap out its rendering without touching the data rules at all. Those two things change at different rates and belong to different people; welding them together is the unnatural option."
+   ]
+  },
+  {
+   "heading": "Restraint at the thin end, honesty at the thick one",
+   "body": [
+    "The contrast on the server side is glaring enough to be worth its own section.",
+    "The layer that receives requests is deliberately thin, offering three things: a registry of routes, a callback to transform the index page's content, and one fallback seat that only a single occupant may hold. It knows nothing about agents and serves not one file of its own. The matching order is fixed: exact table hit, else longest prefix, else the fallback. Registering the same route twice throws, because routes are the composition layer's contract and a collision is a configuration error.",
+    "Static assets are another plugin holding that fallback seat, with the semantics nailed down: non-read methods get 405, anything escaping the root gets 403, and any miss falls back to the index page with a 200. On the plugin bundle paths, though, an unknown id or a file that hasn't been built yet gets a loud 404 — the index page's HTML is never shipped out as JavaScript.",
+    "Even the shutdown is careful: close the server, close all connections, and then manually destroy the long-lived connections that were already upgraded. A handler may be holding open a streaming response that never ends, and the standard close-all-connections doesn't cover upgraded ones — without destroying them explicitly, it hangs there.",
+    "That layer is a good specimen. Then there's the other one.",
+    "Every backend method the browser can call goes through one hand-written file of 3,744 lines. Twenty-eight direct dependencies, twenty-six of them from inside the repo. What it presents outward is a fixed interface, twelve business domains occupying one field each, and no other plugin can register a method into it — adding one capability the client can call means editing that one file.",
+    "That is the exact inverse of the repo-wide pattern where everything is a plugin and every registration is an effect.",
+    "The seam it should have has actually been built: a remote-call contract generated from the type graph, where each business package hangs its own contribution in and the container pulls it back out when the plugin unloads. But the migration is nowhere near done — only a handful of contributions take the new route, and the vast majority of methods are still sitting where they were.",
+    "**The most honest part of a repo is usually the part it hasn't gotten around to rebuilding.**",
+    "I don't count that as a stain. Bad architecture isn't having a monolith. It's nobody knowing where the monolith is, or being able to say why it should come apart."
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "A manifest of right-now plugins, stuffed into the index page",
+   "how": "A normal frontend fixes the set of modules it will load at the moment it bundles. This inverts that: the host scans the client declarations in every loaded plugin package and assembles one row per package — name, bundle address, content hash, dependency edges, whether to prefetch immediately — then hashes the whole graph and injects it as the first script in the page head, with angle brackets escaped so a plugin-controlled string can't escape the script element. The scan is incremental: every plugin construction or disposal marks the matching entry dirty, and the books are reconciled in a microtask.",
+   "why": "The browser and the host share no build output, so this manifest is the only source of truth about composition — what boots is what the host actually has mounted right now."
+  },
+  {
+   "name": "A prefetch barrier cuts startup in two",
+   "how": "The usual approach is to start downloading and creating the moment the manifest arrives, first to land runs first. That doesn't work here: materializing an entry triggers synchronous cross-package references, so the depended-on package's factory has to be registered first, and the container's dependency-waiting machinery doesn't protect synchronous references. So the first half does only two things: prefetch every bundle marked for immediate loading, in parallel (registering factories only, never running plugins), and install the loader with the module system injected straight into it. Only once every prefetch has landed does the second half create entries in a batch. An individual prefetch failure is swallowed silently and left to the creation path to load again and fail loudly.",
+   "why": "It keeps the synchronous-reference edge valid without letting one broken bundle turn the whole startup into a false start before it has really begun."
+  },
+  {
+   "name": "A physical for every plugin once startup finishes",
+   "how": "Waiting in dependency injection generally has no timeout, so a plugin that never gets its service stays quietly pending forever and shows up on screen only as a missing piece. The usual answers are a timeout, or not checking at all. Here a full traversal runs once the whole tree has gone quiet: no running instance means the download or the evaluation failed; still pending means it's waiting on a service, so that service's name gets listed; any other non-active state counts as a failure. One failing row throws, the interface stays on the loading screen, and the report is laid out as-is.",
+   "why": "This is the one cheap moment where \"quietly never started\" can be translated into \"loudly failed\"."
+  },
+  {
+   "name": "Registering a place in the interface is signing a contract",
+   "how": "The usual move is to agree that a UI place is a string mount point anyone can push into, with no validation. Here places are declared explicitly: at compile time through declaration merging on a table of types, and again at load time through a second check — registering into an undeclared place, declaring the same place twice, cardinality conflicts, taking a state handle across scopes all throw at the moment of registration. The registration itself is installed through the caller's container effect and returns an idempotent way to undo it; unloading the plugin cascades away that registration and every sub-place it opened in the same call.",
+   "why": "What is in the interface and the plugin lifecycle have exactly the same shape, so unloading needs no manual cleanup; a misconfiguration blows up at load time instead of surfacing when some slot renders and turns out to have no claimant."
+  },
+  {
+   "name": "A session's life and death bind to whether anyone is looking",
+   "how": "The usual rule is destroy anything not in the list. That fails here, because reconnects and list refreshes both make the current session disappear briefly, and what that destroys is precisely the frozen view. So the signal becomes being on stage: the history window being open is what on-stage means, and opening it is idempotent — in-progress or already-finished openings are skipped, and a failed one retries the next time the current item is touched. A session that leaves the list is torn down immediately, except the one on stage, which is deferred until the stage actually moves away; the current item being temporarily blanked doesn't count as the stage moving.",
+   "why": "Restoring at startup and returning from a reconnect converge onto one code path instead of two branches copied from each other."
+  },
+  {
+   "name": "Derived values answer only to sequence numbers, highest wins",
+   "how": "The usual move is to reimplement the fold on the client, or extract a shared library for both sides. Here the client doesn't fold at all: it stores each key's complete value and its sequence number, and baseline seeding and pushed frames follow the same rule — anything not higher than what's there is discarded. A key absent from the baseline means that capability doesn't exist, so the row is cleared, unless the existing row is newer than the baseline's cut point. On reconnect, a second truncation against the host's durable baseline number blocks state that outranks the host after a restart.",
+   "why": "One monotonic rule blocks replays, out-of-order frames, and outranked state all at once; putting a new domain on screen takes zero client code, and drift between the two folds can't happen at the root."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Let the browser reuse the backend's plugin container semantics instead of inventing a second extension mechanism.",
+   "why": "The same container object, the same mount-point lifecycle, the same rule that a registration hands back its own undo — a developer learns it once. A plugin tree with the same shape on both sides also makes it natural for one package to contribute host behavior and interface together, instead of endlessly hand-aligning two registries."
+  },
+  {
+   "lesson": "Every extensible place in the interface should be declared explicitly as a contract, and validated at load time.",
+   "why": "Type merging at compile time plus a runtime check at load time means registering into an undeclared place, declaring one twice, or conflicting on cardinality all blow up at the moment of registration. That moves the error from \"a piece of the interface is missing\" up to \"a plugin won't start\" — and the second is always easier to locate, because it comes with the scene of the accident."
+  },
+  {
+   "lesson": "Compute derived values in one place; the other side only receives complete values under a monotonic rule.",
+   "why": "The client does no folding, keeping only a map from key to value-plus-sequence-number and discarding anything not higher than what it already has. The cost is that the host pushes more data; the payoff is zero client code for putting a new domain on screen, and drift between the two folds that can't happen at the root — because only one side has any logic."
+  },
+  {
+   "lesson": "Translate \"didn't start\" into a loud error instead of letting it sit there quietly stuck.",
+   "why": "Waiting in dependency injection usually has no timeout, so a plugin that never gets its service stays pending forever. Forcing one full state scan after startup, and listing exactly which service each pending plugin is waiting on, is the cheapest way to bring that kind of silent failure into the open."
+  },
+  {
+   "lesson": "In an incremental view, forbid an already-materialized node from vanishing.",
+   "why": "Once you allow the build to go from returning a node to returning nothing, downstream incremental building has to handle deletion, and key stability can no longer be guaranteed. Forcing \"return the same key, marked hidden\" removes deletion from the incremental protocol entirely, and the price is one extra visibility field."
+  }
+ ],
+ "tradeoffs": [
+  "Every backend method the browser can call is crammed into one hand-written file of 3,744 lines, with twenty-eight direct dependencies and a fixed twelve-domain interface facing outward that no other plugin can register a method into. That is the exact opposite of the repo-wide everything-is-a-plugin pattern. The seam it should have is already built, but the migration is nowhere near done, and two routes coexisting is its own cognitive tax.",
+  "That same file sits on the test-coverage exclusion list, in a repo whose gate demands 100% coverage per source file. Which means the largest file, with the widest dependency surface, that every browser request has to pass through, happens to be one of the very few pieces of product code the gate doesn't bind.",
+  "Startup is all or nothing: one entry failing the full physical leaves the interface parked on the loading screen. That's great for locating problems during development, but it also means a corrupt build output for one peripheral UI plugin makes the entire app refuse to open, rather than costing one feature.",
+  "The place system carries real complexity of its own: four cardinalities times three scopes, plus shadowing and step-down rules, the state-instance axis, the text-namespace seat, and a table of types held together entirely by declaration merging. Type errors tend to surface on the merged mapped type, which is rough on anyone who doesn't already know the machinery.",
+  "The correctness of conversation assembly depends on ordering between definitions and on dependency replay. When a definition misjudges identity, or references across turns, the failure is unintuitive — the node silently turns into a different form rather than erroring, and the only way to investigate is staring at the event sequence.",
+  "The request-receiving layer has no TLS, no authentication, no origin policy, and exactly two binding options: loopback or all interfaces. Binding to all interfaces exposes the agent's entire control plane to that network, and the only thing holding that back is documentation — the code offers no compensating measure."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/client/web/src/boot.tsx",
+   "note": "The browser boot kernel: manifest parsing, two-phase loading, and the full post-startup fiber physical"
+  },
+  {
+   "path": "packages/client/runtime/src/client/slots.ts",
+   "note": "The container service layer for slot registration: effect binding, renderer installation, and the per-session store instance axis"
+  },
+  {
+   "path": "packages/client/runtime/src/client/sessions/service.ts",
+   "note": "Session list snapshots, the staged lifecycle of scopes, and the provide channel for standard props"
+  },
+  {
+   "path": "packages/client/runtime/src/client/contract/conversation.ts",
+   "note": "The full contract for conversation node definitions and the view builder"
+  },
+  {
+   "path": "packages/client/runtime/src/client/sessions/conversation-assembler.ts",
+   "note": "The per-session incremental assembly engine: replace-all / tail append / backward paging and refresh"
+  },
+  {
+   "path": "packages/client/ui-conversation/src/client/chat/register-node-renderers.ts",
+   "note": "Node renderers registered by kind into a keyed slot — the worked example of registering the data side and the render side separately"
+  },
+  {
+   "path": "packages/host/webserver/src/index.ts",
+   "note": "The route registry, the single fallback seat, the index-page injection point, and routing for upgraded connections"
+  },
+  {
+   "path": "packages/host/apiproxy/src/api-proxy.ts",
+   "note": "The 3,744-line hand-written gateway implementation, this archive's counter-example"
+  }
+ ],
+ "related": [
+  "cordis-loader",
+  "cordis-core",
+  "session",
+  "typert"
+ ]
+}

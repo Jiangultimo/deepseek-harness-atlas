@@ -1,0 +1,204 @@
+{
+ "id": "agent-loop",
+ "lede": "What an agent does, stripped down, is one loop: send the history to the model, run the tools the model names, feed the results back, send it again. Sounds like two hundred lines of code.\n\nThe trouble is that the loop can be stopped by the user at any moment, rewritten mid-flight by a plugin from outside, or cut off when the process dies halfway through. And afterward you still have to be able to replay exactly what happened, word for word.\n\n**The moment you demand replay, it stops being a loop — it becomes a state machine plus an append-only ledger.**",
+ "packages": [
+  "packages/core/agent-loop",
+  "packages/core/agent",
+  "packages/core/session",
+  "packages/core/tools",
+  "packages/llm/llm"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "Four layers of time hide inside the loop",
+   "body": [
+    "Think of a conversation as \"the model says something, a tool runs, the model says something else\" and you run out of road fast. A user interjects mid-flight — is that a new turn? A model request times out and gets retried in place — is that an extra step?",
+    "Leave those questions open and the log is unreadable, and replay is off the table entirely.",
+    "The usual answer is a counter in memory: turn number, step number. Single process, no crashes, no restarts — that works fine.",
+    "Here every boundary gets written into the ledger. A session is an append-only stream of events. A turn runs from one waking input until the model no longer owes a reply. A step is one model call plus the batch of tools it named. Each gets an entry when it opens and one when it closes, and the closing entry has to say why it closed.",
+    "Turn numbers don't live in memory either. On construction it goes back through the ledger for the last \"turn opened\" entry and counts on from there — so after a process restart or a session restore the numbering is continuous, not back to one. A turn that gets rejected, or that picks up an empty input, opens and closes with no step entries in between.",
+    "One layer is deliberately not recorded: retrying a model request in place after it fails. Whether to retry is a plugin's call, and a retry recomputes the history, renegotiates the config, and writes a fresh request header if it has to — but it does not open a new step.",
+    "**Whether something earns an entry is never decided by what happened — it's decided by whether what the model sees has changed.**",
+    "Incidentally, the outside world only sees two states, idle and running, but internally there's a third phase reserved for non-model work like compaction: it holds the agent exclusively and blocks new turns from starting, yet still reports idle outward — because it isn't the model talking. State is what you tell the outside; phase is what you use to govern yourself."
+   ]
+  },
+  {
+   "heading": "History isn't accumulated — it's computed",
+   "body": [
+    "Almost everyone writing an agent starts with an array and pushes messages onto it. Works fine, right up until you want any one of three things: context compaction, a plugin that can slip a message into the history, or picking the conversation back up after a restart.",
+    "The usual answer is to make the array the source of truth: want to change the history, change the array. But the array only lives in memory, anyone can write to it, and once they have, nobody knows who did it or what they did.",
+    "Here it's the other way round. The array isn't the source of truth; the ledger is. Every event on the ledger that produces a message carries a marker, and walking the markers in order gives you the history to send for this step. Raw stream fragments, turn boundaries, inbox additions and removals are recorded but never served. A replacement record written by compaction deletes the old content it covers straight out of the projection.",
+    "The cost is rigid: any plugin that wants the model to see a sentence has to write an event first. It cannot push a string into the request directly.",
+    "**This isn't bookkeeping for its own sake. It turns \"what did the model see at the time\" from a question you can only guess at into one you can compute offline.**",
+    "Push the same idea past messages. The system prompt, the tool list, model routing, sampling parameters — none of these are message history, but they decide just as much of what the model sees. So whenever an effective value changes, a full snapshot gets written, tagged with whether it's the first one of a new session, a new loop picking up an existing ledger, or an actual later change. Anyone holding the ledger can fold the snapshots together and rebuild the full picture of any request as it stood.",
+    "The harshest part is an optional plugin that turns the rule into a runtime assertion. It sits at the outermost layer of the model call and independently recomputes every request the loop builds: it must be frozen, the ledger must contain the matching step-opened entry and request header, and then it derives the message array and the folded header itself and compares field by field against the real request. Any mismatch fails on the spot, on the grounds that this request has lost contact with the ledger.",
+    "A rule written in the docs is discipline. A rule written as an assertion that blows up on contact is a constraint."
+   ]
+  },
+  {
+   "heading": "The cancel signal has to arrive before the resources do",
+   "body": [
+    "Cancelling a running agent — the hard part isn't stopping it, it's stopping it somewhere that doesn't leak.",
+    "The nastiest case is a cancel that lands while the agent is still being built. The session object exists, the driver doesn't yet, the scope isn't open. What do you tear down?",
+    "The usual answer is to register the cleanup once everything exists. Sounds reasonable, but a cancel that arrives during the not-yet-registered window finds nothing to call, and the resources just sit there.",
+    "Here the order is inverted: build the kill switch first, then the resources. The kill switch is registered against a mutable slot, and each resource drops into the slot as it comes into existence. A cancel arriving mid-build always finds a teardown function that works as of right now.",
+    "Cancels come from three places: one the caller passes in, the runtime that owns the agent being unloaded, and the whole factory shutting down. Each carries its own reason, and all three fuse into one signal. Restoring an existing session gives it one more job — a load from the persistence backend may never return, so all three signals race it; and if the load hands over an object only after the cancel, that unclaimed object gets released on its own instead of sitting there leaking.",
+    "Inside a turn there's a second set of cancels, with four reasons: the user, a parent, a hook, teardown. They affect what gets recorded, not what gets cleaned up.",
+    "**Knowing why you stopped and knowing what to do about stopping are two different things. Blur them and you end up writing \"it was a user cancel, so skip releasing one resource.\"**",
+    "One detail that's easy to miss: when a turn ends and the next one is about to open, a brand-new kill switch replaces the old one and the old wake latch is cleared with it. The new driver picks up its own work from the queue, so replaying the stale latch would just run the same thing twice. A cancel that arrives while idle is a no-op — it doesn't plant a cancel for work that comes later."
+   ]
+  },
+  {
+   "heading": "Concurrency only opens where order can't be affected",
+   "body": [
+    "The model names five tools at once, all five are file reads, and running them serially costs five times as long. But the moment you allow parallelism you owe an answer to one question: in what order do the results go back into the history?",
+    "Completion order is the easiest and the worst: run the same input twice, get two different histories, and replay is void on the spot.",
+    "The usual answers are all-serial (safe, slow) or all-parallel with a sort on write-back (fast, but you're betting the tools really don't touch each other).",
+    "Here dispatch and commit are split apart. Dispatch is allowed to overlap; commit advances strictly in the order the model listed the calls: until the k-th has landed, the k+1-th waits, however long ago it finished. Everything that leaves a trace — the pre-checks, finalizing the result, writing to the ledger, taking in the extra context a tool carries out with it — happens serially on the commit side.",
+    "Which calls may run in parallel is declared by the tool itself, and it's asked with the concrete arguments for this call in hand. No declaration, no ability to declare, or an exception while asking — all three are treated as exclusive.",
+    "**It fails conservative: when in doubt, serialize — not when in doubt, parallelize.**",
+    "More important, the classification isn't computed once. Before every top-up of the pool, the next call is asked again — because the result that just committed may already have changed the tool list, swapping a tool out or adding a new policy. If a barrier is warranted it forms right there, the pool stops growing, and the rest is left to the next group.",
+    "The pool caps at 10 by default, it's configurable, and it's re-read at the start of each group. Change the setting and the next group picks it up, without disturbing the one in flight.",
+    "All the gain from parallelism lives in the time the tool body takes; the policy checks and the ledger writes take essentially none. Overlap only the slow part and you never write a line of compensating logic for out-of-order results — because they can't happen."
+   ]
+  },
+  {
+   "heading": "When you cancel, write more, not less",
+   "body": [
+    "A group of tools gets cancelled halfway through. The natural reaction is to put the pen down: there's no result anyway, so what is there to write?",
+    "The problem is the model already called those tools out loud. What's left in the ledger is a run of calls with no results. Replay it and the conversation is malformed at the protocol level; the model sees several calls dangling in mid-air, and nobody can say how it reacts.",
+    "Here it goes the other way. The calls already started are drained and committed in order, extra context included. Then, for every call in the group that hadn't started, and every call in the step that never even made it into a group, it writes a call record plus a synthetic failure result, one pair at a time, with a fixed error code meaning aborted before dispatch and fixed text to match.",
+    "**On replay the model sees a well-formed failure, not a call left hanging.**",
+    "But there's a line here you don't cross. When the scheduler itself breaks — not a tool failing, the scheduling logic itself faulting — the path is completely different: stop dispatching, wait for what's already started to settle, throw the first fault untouched up to the turn's error boundary, and never invent a tool result.",
+    "What's the difference? An abort is a known outcome with a meaning attached; you know why there's no result, so you can write it down on its behalf. A scheduler fault is an unknown state; you don't know, and making something up is fabricating a fact.",
+    "The line is drawn at whether you know why there's no result, not at whether filling in the gap makes things look tidier.",
+    "The same fussiness governs another pitfall: on the step where the model hits its output limit, assembly drops every tool-call block out of that message before handing it to the loop, so you never get half a truncated tool call actually executed. The message itself is still recorded — it carries the token usage — but it doesn't enter the model's history."
+   ]
+  },
+  {
+   "heading": "Opening a session is a transaction you can roll back",
+   "body": [
+    "Building an agent takes six or seven things: a private session, a driver, a scope, an optional init hook, entries in two registries, and one lifecycle notification. Any step failing means every step before it has to unwind cleanly.",
+    "Worse, that last notification is itself dangerous — a synchronous listener can perfectly well tear the agent down the instant it receives it. Which is to say: the thing you're about to return may already be dead.",
+    "So a liveness re-check sits between every step, and the whole creation is written as a transaction you can roll back.",
+    "Teardown runs in strict reverse: stop the machine, wait for it to go quiet, unload the scope, unregister the agent, unregister the session, clear the bookkeeping. And the whole teardown happens exactly once — the caller releasing the handle, the owner being unloaded, the factory shutting down: all three paths end up waiting on the same single teardown rather than each running their own.",
+    "The restore path has one more wrinkle. Agents declared in config run restore-if-present, create-if-not: try the restore first, and if it fails, go back and ask the backend whether that identifier exists at all. If it does, rethrow the original error as-is — that means data corruption or a backend fault, and it has to make noise. Only if it genuinely doesn't exist does it fall through to first-time creation.",
+    "**Not found and found-but-unreadable have to be treated differently. Turning both into \"fine, make a new one\" is the most common way people write data loss.**"
+   ]
+  },
+  {
+   "heading": "What it buys isn't speed — it's replay",
+   "body": [
+    "String all of the above together and they turn out to be projections of one rule: anything that affects the model goes into the ledger before it takes effect.",
+    "The history is a projection of the ledger. The request header is a fold over the ledger. Cancellation registers ahead of the resources so the ledger never stops half-written. Tool commits follow model order so the ledger produces the same content for the same input. Aborts fill in synthetic results so the ledger contains no passage you can't read.",
+    "**The whole package is a bit over sixteen hundred lines, which is not much room for this many jobs. What it buys isn't performance and it isn't a smaller line count — it buys the single property that this run can be played back exactly as it happened.**",
+    "Once that property holds, everything else becomes possible: crash recovery, snapshot replay, pre-release regression, after-the-fact audits when something goes wrong — all of it comes free off that one property. And if it doesn't hold, no amount of tooling piled on top gets any of it back.",
+    "I've come to think that judging whether an agent framework is mature has nothing to do with counting how many models it connects to or how many tool protocols it speaks. One thing is enough: can it take one specific run and play it back, word for word."
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Input lands in two queues, and queue changes are recorded too",
+   "how": "The usual answer is to append external input straight onto the conversation array and then find some way to wake the loop. Not here: input goes into two ordered queues first, one lining up for the next turn, one cutting into the nearest next step. The three public entry points are really three presets over one primitive — enqueue and wake, cut in and wake, cut in without waking. The real difference is that every queue change writes a normalized positional add/remove event first, and only then updates the in-memory projection. Insert, edit, delete, claim, and cancel all replay against the same set of coordinates; and a synchronous observer still reads the queue as it was before the change, so it can work backward from the coordinates to which entries were taken out. A claim is a pure removal, and each message fires its claimed notification exactly once.",
+   "why": "It makes \"what input is pending right now\" a durable, replayable piece of state in its own right, instead of an array in process memory that can vanish at any moment."
+  },
+  {
+   "name": "Mark who filled in a default",
+   "how": "The usual answer is to gather sampling parameters, reasoning effort, and output limits into one config and carry it along. The trouble is that config mixes two origins: what the user set explicitly, and what the current model filled in for itself. Switch model routes and the latter turns into a ghost — the previous model's defaults ride along disguised as the user's choices. Here the adapter leaves a mark when it fills in a default: the request header records not just the effective values but which fields were filled in. On the next negotiation, marked fields are stripped from the proposal first so the new route can fill in its own, while unmarked explicit settings persist across steps and across routes. The prepare call also holds onto that one specific adapter registration all the way through to final dispatch, so a hot reload can't apply A's conclusions about capability to B's request.",
+   "why": "When you switch models, the previous model's defaults shouldn't ride along pretending to be the user's explicit choices."
+  },
+  {
+   "name": "History only computes the entries that are new",
+   "how": "\"Recompute the history from the ledger on every step\" sounds like paying full price every time, and a long conversation would eventually drag itself down. The usual dodge is to cache an array and stop recomputing — which is normally how correctness gets lost. Here the recomputation is made cheap instead: the surface node sequence only grows at the end, each node is projected once and cached, and a call only pays for the new nodes. What comes back is a fresh array snapshot, so later appends don't grow into an array somebody else is already holding; the message objects inside are shared and deep-frozen, reusing the already-frozen event data directly and skipping a second deep copy. When compaction rewrites the surface it swaps in a new tag, and a changed tag invalidates the cache wholesale and rebuilds. An assistant message with empty content projects to nothing and never enters the history.",
+   "why": "You want the correctness of recomputing every step without paying full price every step — both have to hold at once before anything else is worth discussing."
+  },
+  {
+   "name": "Teardown has exactly one quiet point",
+   "how": "An agent can be held by three parties at once: the caller that created it, the runtime that owns it, and the factory. Any of the three may shut down first. The usual answer is for each to write its own cleanup and then pray for idempotence. Here the teardown function records the teardown the first time it's called, and every subsequent trigger waits on that same one instead of running its own. The order is the strict reverse of construction: send the machine a teardown cancel and wait for it to go quiet, unload the private scope, unregister the agent, unregister the session, then clear the tracking and hooks. Each unregistration is bound to that specific object, so a stale teardown can never delete a newer instance that has since taken the same identifier.",
+   "why": "With several owners tearing down the same agent, two quiet points is all it takes to tear the registry state in half."
+  },
+  {
+   "name": "The window between a cancel and a new message",
+   "how": "Once a cancel goes out, the loop isn't idle immediately — it's still settling. A new message arrives in that window asking to wake it. Now what? Add it to the current activity? The activity is already aborted. Drop it? The message is gone. Start a new turn right away? It collides with the one on its way out. Here it's forced into the next-turn queue, and the intent — somebody asked for a wake — is latched, to be replayed on the caller's behalf once the driver settles to idle, so the caller doesn't have to send it again. The classification is computed before the insertion into the queue, so a reentrant cancel triggered during the insert can't change it. The one exception is a cancel caused by teardown, which never latches — otherwise you'd tear halfway down and open a fresh model turn.",
+   "why": "Don't latch and you lose the message; latch the wrong thing and you run it twice. There's no third option to settle for in between."
+  },
+  {
+   "name": "If the environment snapshot hasn't changed, don't send it again",
+   "how": "Things like the current directory and the workspace state can change on any step, so the easiest move is to render one every step and push it in. The cost is duplicate tokens, plus a broken cache prefix — change the prefix and everything after it is void. Here it renders as a single snapshot message, and the projection remembers the last snapshot still on the surface along with its text: unchanged text sends nothing new, changed text sends one. It also watches the session events, and if a replacement record written by compaction covers that snapshot, it clears the memory and starts over. When all the content disappears, it sends an explicit note that the earlier snapshot no longer applies, rather than quietly leaving the old one standing.",
+   "why": "Disappearing quietly costs more than sending twice — the model goes on believing a fact that has expired, and nobody knows it's believing it."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Make the durable ledger the only source of truth, and treat in-memory structures as nothing but its projection.",
+   "why": "Every decision in the loop that could affect the model writes an event before it takes effect, so what the model saw can always be rebuilt offline. The cost is real: plugins can't push content into a request directly, they have to go through the ledger. What you get back is crash recovery, replay, and after-the-fact audits for free — you didn't build those features on the side, you couldn't have avoided them."
+  },
+  {
+   "lesson": "Register the cancel signal before any resource is created.",
+   "why": "Construction is itself asynchronous, and an unload can land right in the middle of it. If the cleanup only registers once the resources exist, a cancel arriving in that window has nothing to call and the resources just stay where they are. Build the kill switch first, then drop resources into a mutable slot, and the window shrinks to zero — it's a pure ordering trick that needs no extra abstraction."
+  },
+  {
+   "lesson": "Only open up concurrency where order doesn't matter.",
+   "why": "All the time a tool takes is in the body; the policy checks and the ledger writes take essentially none. Overlap only the body and let commits advance in strict model order, and you get the benefit of parallelism without designing any compensating logic for out-of-order results — because they simply can't happen. Eliminating a whole class of bug pays far better than fixing that class of bug."
+  },
+  {
+   "lesson": "Re-read the classification before every dispatch, not once at the start.",
+   "why": "The tool list is alive, and the result that just committed may already have changed it. Classifying once up front means a newly added exclusivity constraint has no effect on the current group at all, while reclassifying costs one lookup and makes a policy change take effect immediately. Recomputation this cheap — cheap enough that there's no reason not to — is often the last line of defense for correctness."
+  },
+  {
+   "lesson": "Separate filling in a known failure from inventing an unknown result.",
+   "why": "Both cases lack a real result, but an abort has a known meaning — you know why it never ran, so you can write a fixed failure record on its behalf. A fault in the scheduler itself is an unknown state; you don't know, and anything you write is a forgery. The line is drawn at whether you know why there's no result, not at whether filling it in looks tidier."
+  }
+ ],
+ "tradeoffs": [
+  "Every step resends the full system prompt, the whole tool list, and the accumulated history. The input cost of a multi-step tool turn grows linearly with the number of steps, and cache reuse only holds when those bytes are identical — any rewrite of how the prompt is assembled voids everything from the first changed token onward. This is the most direct bill for recomputing every step.",
+  "The concurrency classification is unary: it looks only at a single call's own arguments and cannot express \"these two calls conflict if they run at the same time.\" Any tool whose safety depends on comparing sibling calls, or on a shared resource, falls back to exclusive execution wholesale and gets none of the parallel benefit. Conservative is right, but conservative has a price.",
+  "The parallel pool's cap is a single deployment-level number applied to every tool alike. It can't say \"twenty at a time for network work, two for file writes\" — there are no per-resource quotas — so when you tune that number you're really setting the ceiling for the most dangerous class of tool.",
+  "There's no built-in turn budget. As long as tools keep producing results, or steering input keeps arriving, the current turn can run indefinitely. Stopping a runaway turn requires a plugin to cancel it actively at the turn-wrap-up extension point — the mechanism is open, but the fact that nothing guards it by default is on you to keep in mind.",
+  "Structured errors only survive for one class, model-call failures, which keep the complete facts of the failure. Every other exception gets flattened into a blob of text plus an unknown error code and written into the turn-closed entry, with no way to tell them apart by type afterward. For a system that treats the ledger as the source of truth, this spot contradicts itself.",
+  "Agents declared in config get no per-agent persona fields and no init hook; they're stuck with the deployment-level persona. Customizing the prompt and tool set per agent is only available through programmatic creation. And omitting a stable identifier means every start is a fresh session — restore-if-present, create-if-not requires giving the identifier explicitly."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/core/agent-loop/src/agent.ts",
+   "note": "The driver itself: the turn/step loop, request construction, cancel phases, and the wake latch (~496 lines)"
+  },
+  {
+   "path": "packages/core/agent-loop/src/tool-calls.ts",
+   "note": "Tool scheduling within one step: the rolling pool, reclassification before each top-up, commits in model order, and fill-in writes on abort (~289 lines)"
+  },
+  {
+   "path": "packages/core/agent-loop/src/index.ts",
+   "note": "The factory service: the create/restore transaction, the three-source kill signal, memoized reverse-order teardown, and the parallel-cap config (~713 lines)"
+  },
+  {
+   "path": "packages/core/agent-loop/src/constants.ts",
+   "note": "The parallel pool's default cap, DEFAULT_MAX_PARALLEL_TOOL_CALLS = 10"
+  },
+  {
+   "path": "packages/core/agent-loop/src/invariant.ts",
+   "note": "The runtime assertion: every request must be rebuildable field by field from the session log"
+  },
+  {
+   "path": "packages/core/agent-loop/src/runtime-context.ts",
+   "note": "Snapshot deduplication for dynamic runtime context, plus tracking invalidation by compaction"
+  },
+  {
+   "path": "packages/core/agent/src/inbox.ts",
+   "note": "The two-queue inbox: splice event first, claim as pure removal"
+  },
+  {
+   "path": "packages/core/session/src/index.ts",
+   "note": "Incremental projection, caching, and fold-based rebuilding for deriveMessages and requestHeader"
+  }
+ ],
+ "related": [
+  "agent",
+  "session",
+  "tools",
+  "llm",
+  "compaction"
+ ]
+}

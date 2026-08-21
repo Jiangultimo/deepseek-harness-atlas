@@ -1,0 +1,203 @@
+{
+ "id": "agent",
+ "lede": "You drop a line into an agent that's already running. When does that line take effect?\n\nSounds like a small question. Try to implement it and it drags a string of harder ones behind it: does that line start a new turn, or slot into the round already running? Should the behavior be the same whether the agent is busy or idle? If it gets cancelled halfway through, does that line count as having run or not — and who keeps that ledger?\n\nThis chunk of code answers exactly that class of question. It has no loop of its own, not one line of driving logic. All it defines is what an agent is: seven methods, twelve lifecycle events, a roster of the live ones, plus a per-agent view of what's registered.\n\n**It splits what an agent is from how an agent runs into two packages — and the interface side has no idea the loop exists.**",
+ "packages": [
+  "packages/core/agent",
+  "packages/core/scope",
+  "packages/core/agent-loop",
+  "packages/core/tools",
+  "packages/preset/agent-presets"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "The interface doesn't know about the loop",
+   "body": [
+    "In an agent runtime there are always plenty of plugins wanting to extend behavior. Ones that want to intercept a step, ones that want to change the model request settings, ones that want a word in before a turn wraps up, ones that want to count usage — where do they all hang?",
+    "The usual answer is: on the loop. The loop is where behavior lives, so that's where extension points naturally grow. The price is that the loop becomes a giant everyone has to depend on, and replacing it means rewriting every plugin.",
+    "Here it's inverted. The package that declares what an agent is contains no loop code at all. Just an interface, a roster of live agents, twelve events. The package that actually runs the loop is a different one, and on startup it registers the ability to create an agent backwards into an empty slot the roster left open.",
+    "So the roster can't build an agent itself. Creating and restoring both get handed off to whatever factory registered; with no factory it throws on the spot, saying plainly that a loop plugin is missing, instead of quietly handing back an empty object.",
+    "There's a deliberate detail in the hand-off: the factory gets rebound to the caller's context. Whoever calls create owns the lifecycle that comes out of it, not the place the factory happened to be registered.",
+    "And create doesn't return a bare object either — it returns a handle with a teardown key inside. That key is the permission: only whoever holds the handle can tear this agent down, and the bare object you look up in the roster by id can't.",
+    "**Extension points grow on the interface, not on the implementation — that's what earns the implementation the right to be swapped out whole.**"
+   ]
+  },
+  {
+   "heading": "Where an interjected line lands",
+   "body": [
+    "External input arrives, and the first instinct is to add a queue. But once you actually separate out the situations where a user interjects, you find that interjecting means at least three different things:",
+    "- One more thing — this should stand on its own as a new turn",
+    "- A word inside the current round — this should cut into the reasoning already running",
+    "- Just a bit of extra context — this shouldn't wake a sleeping agent",
+    "The usual answer is one queue plus a few boolean flags. It works, but the meaning rests entirely on the caller behaving well: the difference between the three behaviors hides inside combinations of flags, where nobody reading the code can see it.",
+    "Here it's split into two ordered pending slots plus a wake-or-don't switch. All three public methods go through the same underlying delivery; the only difference is which slot it lands in and whether anything wakes up.",
+    "The first slot is the turn slot: everything dropped there becomes a turn of its own. The second is the step slot: a running driver swallows the whole batch at the next step boundary.",
+    "The non-waking kind is the subtle one. It only adds context to a request already in flight. While the agent is idle it just lies there, and gets carried along when the next real input wakes the driver. It can also miss a step that just collected its batch — that isn't a bug, that's the definition.",
+    "Collecting is what the loop does at a step boundary: take the whole step slot first, and if this step is also opening a new turn, take one more from the head of the turn slot. So the first step of a turn carries both the queued turn input and every interjection piled up behind it; every step after that carries only interjections.",
+    "**The three meanings were originally one parameter apart. Turn them into three places and the meaning stops depending on the caller remembering it.**"
+   ]
+  },
+  {
+   "heading": "Did this input actually run?",
+   "body": [
+    "Here's a question that looks simple and that staring at the turn sequence can't answer: that line the user just sent — did it ever run?",
+    "A turn that ends before reaching its first step has an end event identical to a turn that spun once and did nothing. Read by turns, you either count the ones that died early as completed, or judge every idle spin a failure.",
+    "The usual answer is to add a field: on cancel, jot down how far it had gotten. The trouble is that cancels start in several places — the handle holder tearing it down, an interrupt from above, a plugin unloading — and every one of them has to remember to jot. Miss one and the ledger doesn't balance.",
+    "No field was added here. Instead it goes back and reads what was already written down.",
+    "The whole thing turns on one word of difference: collecting is a plain removal with no cancelled mark, while an actual discard carries one. The same act of deleting from a list, with that one extra field, now tells apart taken away to be run from thrown out unrun.",
+    "So a single pass over the log folds out three cases: turns that reached a model step, turns that collected and then failed or were stopped, and input that was collected and then cancelled outright, never getting a chance to run. One exception is judged separately — a stepless turn that ends in completion doesn't count against the ledger, because what it collected was rewritten away and there really was nothing left to run.",
+    "The fold eats the log only; it samples no runtime state. So whoever started the cancel, the ledger reads the same.",
+    "**A question the boundary events can't answer usually doesn't need a new field. It needs you to look back for an existing record that can be split in two.**"
+   ]
+  },
+  {
+   "heading": "Visibility tied to life and death",
+   "body": [
+    "Several agents run in one process at once, each possibly carrying different tools, different prompt fragments, different capability restrictions. Those registrations have to be visible only to their own agent, and to vanish when it does.",
+    "The usual answer is one table keyed by id plus a body of deregistration logic. Visibility comes from the table's key, lifetime comes from the deregistration code — define the two separately and you grow registrations that are visible in one scope but hang off another scope's lifetime, and one change in teardown order gives you a dangling reference.",
+    "The move here is to take an opaque object as the key and mint a context stamped with it. Every registration made through that context derives both its visibility and its lifetime from that one minting. The loop mints one per live agent, and the key is the agent object itself.",
+    "Keys can also chain parent to child, and that chain gets read in two opposite directions. Registrations inherit downward: a child sees its ancestors', and on a name clash the nearest covers the farther. Event admission travels upward: a listener at an ancestor level receives its descendants' events, never the other way round.",
+    "This is how a preset works. A composition mounts once, forming a parent scope; after that, every agent joining just hangs its own key underneath, mounting nothing again. A child agent inheriting the parent's capabilities is that same act of hanging a key, not a re-parse of a config file by id.",
+    "Restrictions intersect. A scope can allow or block inherited tool names, and a name survives only if every restriction at every level of the chain lets it through. Any level can block a name for every agent below it, and no level can reopen something another level shut.",
+    "But restrictions govern only what's inherited, never what this level registered itself. That isn't an oversight: the delegation runtime registers the tool a child agent reports its result with into the child's own level, so if the filter covered the local level too, putting a single restriction on a child would also cut off the channel it answers back through.",
+    "A misconfiguration blows up at registration. Calling outside a scope throws — a restriction like that would be global and would hit every agent in the process. An empty filter throws, since it's almost always a config that parsed into nothing. A name outside the restrictable set throws too.",
+    "**Power can only tighten, never loosen — write that rule into the merge algorithm itself and nobody has to audit configs one by one.**"
+   ]
+  },
+  {
+   "heading": "Events shouldn't be broadcast to everyone",
+   "body": [
+    "Twelve lifecycle events, five agents running in the process at once. A listener attached to A shouldn't receive B's events.",
+    "The usual answer is to stuff the agent into the event payload and have every listener write a check on its first line. Workable, but every listener has to remember, and missing one crosses the wires — and crossed wires don't throw. They just quietly file B's logs under A.",
+    "What gets passed at dispatch here isn't the agent — it's a carrier holding nothing but a routing key. It exposes none of the subject's properties; the subject rides in the payload. The admission rule is short: a listener whose context carries no scope mark receives everything, which is how logging and the UI stay global observers; a listener that does carry a mark receives an event only when its mark equals the routing key or is one of that key's ancestors.",
+    "There's a built-in risk of the two drifting apart. The routing key and the agent field in the payload could be written as two different objects. The filter goes by A, the payload says B, the event reaches the wrong audience — and again nothing throws.",
+    "So dispatch isn't hand-writable at all. One fused dispatcher holds carrier and subject together; callers pass only the payload fields other than the subject, and the subject is injected after the spread, so even an object that happens to arrive carrying a field of the same name can't overwrite it. In development there's also an invariant plugin sitting on the dispatch hook, checking event by event that the carrier's key and the subject named in the payload are the same object.",
+    "Failures in notification events are caught one at a time: every listener is wrapped on its own, and both a synchronous throw and an async rejection produce nothing but a warning. That way one broken observer neither starves the observers queued behind it nor gets to veto the lifecycle moving on. Where a veto really is needed, a different class of event handles it — the pre-step middleware chain, for instance, which can reject outright or replace the whole batch of input.",
+    "**Move who should receive this out of every listener's first line and into dispatch itself, and crossed wires stop being a discipline problem and go back to being a type problem.**"
+   ]
+  },
+  {
+   "heading": "Furnish the world first, then let anyone see it",
+   "body": [
+    "The instant an agent is built, it may have none of its tools, prompt fragments, capability restrictions, or listeners installed yet. Do you announce it now?",
+    "Announce too early and observers see a half-built thing. Announce too late, though — if any step in between fails, you've already left a half lifecycle behind, one somebody saw created and will never see destroyed.",
+    "The usual answers are either to insert into the table first and assemble at leisure, or to simply agree that listeners should wait a bit. The first leaks the half-built thing; the second is back to relying on good behavior.",
+    "Here creation is split into entering and announcing. Entering validates the identity, makes the one and only duplicate-name ruling, and puts the entry in the table without broadcasting. Announcing waits until all external composition is done, then emits the creation event. When the same id is created concurrently, several are allowed to prepare, but only one can enter, and the rest roll back whole.",
+    "The composition window is that stretch of furnishing the world. The creation options carry a callback, and what it receives is exactly this agent's not-yet-published scope context; it can also return a synchronous commit function for one last check at the final moment before publication. If the callback throws, the commit refuses, or the handle holder destroys it midway, the whole transaction rolls back and neither identity is ever published. The callback's contract is: compose only, don't drive.",
+    "Teardown has a counterintuitive detail. If a synchronous listener on the creation event asks right there to tear this agent down, the teardown is deferred until that broadcast has fully unwound. By the same logic, an entry that was never broadcast emits no destruction event when it rolls back — that would conjure a lifecycle edge that can't exist.",
+    "There's one more piece of care about the identity of a function: what gets handed out is the one-shot cleanup function exactly as it is. For the layer above to tear things down in order — stop the driver, drain, deregister, then take the scope apart — it has to pass that function along untouched. Wrap it and it counts as a separate effect, becomes a concurrent sibling task, and may deregister the agent and fire the destruction event while the last turn is still draining.",
+    "**A lifecycle event is a promise: emit a creation and you owe a destruction. Better to emit late than to emit half of one.**"
+   ]
+  },
+  {
+   "heading": "Who caused this call",
+   "body": [
+    "Downstream code keeps wanting to know one thing: which agent caused the call happening right now? Logging needs it, usage accounting needs it, attribution needs it.",
+    "The usual answer is to thread it down as a parameter. The problem is that it pollutes the signature of every layer along the way, and the moment one layer in the middle is somebody else's code, the chain breaks.",
+    "What's used here is async local storage — an implicit ambient value that rides down an async call chain by itself. The driver wraps one entire run inside it, and any layer on the chain can read who started it. Concurrent drivers don't disturb each other, a child driver's continuation carries the child agent, and the parent's continuation snaps back to the parent agent the moment the call returns.",
+    "There are two matching ways to read it, and the difference is deliberate. One allows there to be no originator, for general paths that also support agent-free calls. The other throws when there's none, for private helpers whose contract says they must sit under a driver. There's also a boundary that clears it in the other direction, meant for building lazily created shared timers, connection pools, and exporters — so they don't inherit whichever agent happened to initialize them first.",
+    "Creation, loading from storage, and composition are deliberately kept outside the child agent's boundary: composition started by the parent reads the parent as originator, and the child's identity comes explicitly from its own scope context.",
+    "The reach of this is nailed down too. It's same-process causal attribution, nothing more — not proof of liveness, not authorization. Across a worker, across a process, onto disk, onto the wire, it's gone.",
+    "**Implicit passing is only good enough for attribution. It saves you threading a parameter through, but this agent is in the ambient environment proves neither that it's still alive nor that the caller has any right to touch it.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "The inbox is really a projection of the log",
+   "how": "The usual answer is a queue in memory, and after each change you write the new state to disk and read it back on restart — memory is authoritative, the log is a backup. Here it's inverted: the two pending lists are themselves a projection of one class of session event. On construction, state is rebuilt by replaying every historical change after the session's seed boundary; after that, each change writes the normalized operation to the log first and only then touches the in-memory list. The order is deliberately reversed — a synchronous log observer still reads the list as it was before the change, so from the start position and deletion count in the event it can work out for itself exactly which entries went. Writes are checked first for coordinates and message-id uniqueness; out of range or duplicate throws on the spot.",
+   "why": "Anything the model can see has to be reconstructable from the log; otherwise pending input vanishes into thin air, or runs a second time, after a restart or a resumed session."
+  },
+  {
+   "name": "Collecting and discarding differ by one mark",
+   "how": "The usual answer is to attach a snapshot of how far it had gotten to the cancel action. But cancels start in several places — the handle holder tearing down, an interrupt from above, a plugin unloading — and each one has to record it; miss one and the ledger doesn't balance. The move here is to make the deletion itself carry intent: collecting deletes without the cancelled mark, while an ordinary removal or a clear sets it. What a collection targets also decides whether a new turn opens — taking only interjections takes the whole step slot, and opening a new turn takes one queued turn input on top of that. Each message taken then emits its own notification carrying the turn number.",
+   "why": "The same act of deleting from a list has two opposite meanings: taken away to be run, and thrown out unrun. That one extra field is what lets whoever reads the log later tell them apart."
+  },
+  {
+   "name": "Visibility and lifetime from one source",
+   "how": "The usual answer is a registry grouped by id plus a chunk of deregistration code: the table's key decides who can see it, the deregistration code decides when it goes away. Define the two separately and you grow registrations that are visible in one scope but hang off another scope's lifetime. The move here is to mount an empty plugin as the host at minting time, then write an opaque mark into the derived context. From then on a registration made through it takes its visibility from the mark and its lifetime from the host, both out of that same minting. Teardown gets two doors: the one-shot cleanup function exactly as it is, for the layer above to nest in order, and an idempotent quiet boundary where concurrent calls share a single completion and wait until the host's async aftermath has settled."
+  },
+  {
+   "name": "Layered storage, nearest wins",
+   "how": "The usual answer is a table per agent, and when inheritance is needed you copy the parent's table wholesale. The copy is stale immediately — anything the parent registers later can never get in. The move here is one global layer plus however many layers get built lazily per scope key. A read takes whichever layers on the chain already exist, orders them from the farthest ancestor down to itself, and lays them one by one into a single map, later writes covering earlier ones, so the nearest scope wins. On a write, which layer to change and who owns the change both come out of the same context, and the undo function is in place before any change notification goes out. A layer is reclaimed only once all of its tables are empty. There's also a read that deliberately ignores the chain, for the cases that must see nothing but their own layer."
+  },
+  {
+   "name": "Routing key and subject injected by the same hand",
+   "how": "The usual answer is to stuff the agent into the event payload and have each listener decide up front whether the event is any of its business. The move here is to pass, at dispatch, a carrier holding nothing but a filter function, chaining the subject's existing filter together with the scope ruling rather than replacing it. The dispatcher holds carrier and subject at once; callers pass only the payload fields other than the subject, and the subject is injected after the spread — so the routing key and the payload's subject cannot point at two objects, and that drift can't even be constructed in the type system. In development an invariant plugin sits on the dispatch hook and checks each one. On the hot path the carrier is built once when the agent is constructed and reused, so dispatch allocates nothing."
+  },
+  {
+   "name": "Wait for what's in flight before closing the door",
+   "how": "The usual answer is to disable the underlying storage the moment you shut down, at which point calls still in flight read an empty environment and throw a pile of errors nobody can read. The move here is that every boundary created registers a releasable run record, bumps a count, and remembers its parent record. A synchronous return releases on the spot; an async result gets releases attached on both the fulfilled and rejected branches, and even the case where the async result's constructor has been overwritten so no observer can be attached is caught. On shutdown, new boundaries are refused first, then the whole self-referring chain of boundaries currently open is lifted out of the count — otherwise unloading would wait on itself — then it waits for the count to reach zero, and only then disables the underlying storage."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Split what it is from how it runs into two packages, and let extension points depend only on the first.",
+   "why": "Every plugin is written against the interface, so the loop implementation can be replaced whole; conversely the loop doesn't have to depend backwards on every observer just to be observed. Even the ability to create an agent is registered backwards, at loop startup, into an empty slot in the interface package — the interface side depends on the loop not at all."
+  },
+  {
+   "lesson": "Inject the routing key and the event's subject in one act; don't let callers pass them in two places.",
+   "why": "Pass them in two places and one day they will be written as two objects: the filter goes by A, the payload says B, the event reaches the wrong audience, and nothing throws. Merge them into one act and that drift can't be constructed in the type system at all, with a development-time assertion behind it as backstop."
+  },
+  {
+   "lesson": "For registrations you can undo, let visibility and lifetime come out of the same context.",
+   "why": "Defined separately, you get registrations visible in one scope but hanging off another scope's lifetime, and one change in teardown order gives you a dangling reference. Derive both from one context and that class of bug doesn't exist structurally, instead of depending on people reviewing them one at a time."
+  },
+  {
+   "lesson": "When a state machine's boundary events can't answer the question, fold the log instead of adding a field.",
+   "why": "The turn sequence itself can't tell a turn that died halfway from one that spun idle, because their end events have the same shape. The answer was already written in the inbox's deletion records; that record just needed to carry one piece of intent. An answer folded out of the log reads the same no matter who started the cancel, and nobody has to sample runtime state before cancelling."
+  },
+  {
+   "lesson": "Use implicit context passing for attribution only; never make it carry authorization.",
+   "why": "An ambient value saves you threading a parameter through every layer, but this agent is in the environment proves neither that it's still alive nor that the caller has any right to touch it. Across a process, across a worker, onto the wire, onto disk — all of it is lost. Authorization and identity have to travel in explicit fields; they don't get to hitch a ride on this free lift."
+  }
+ ],
+ "tradeoffs": [
+  "Originator attribution is in-process. Across a worker, a subprocess, HTTP, a durable queue, or a restart it's gone, and those boundaries have to carry the identity explicitly and resolve it back into an agent that is genuinely still alive. The interface side writes this down as a known limitation itself.",
+  "A scope is not a sandbox and not a permission boundary, only routing and lifetime ownership among trusted plugins in the same process. And handing someone a scope context also hands them the entire service-resolution surface of the plugin that minted it, which the holder cannot narrow after the fact.",
+  "A context carries only the nearest scope mark; the hierarchy lives entirely on the key's parent chain. Nested scope contexts shadow one another down to a single mark, so multiple membership — one agent belonging to two sets of policy at once — isn't supported.",
+  "Only registries that deliberately layer themselves by scope are actually isolated. An ordinary framework service keeps process-wide shared state even when it's called through a scope context; the scope context provides no isolation of its own.",
+  "The notification event at startup is only a notification and cannot veto the start. Async composition that must finish before publication has exactly one place to go, the composition callback inside the creation transaction. There is no second place.",
+  "Cancel clears the inbox along with everything else by default; with the keep option it aborts only the current turn. There's no setting in between for interrupting just this step and letting the turn keep running."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/core/agent/src/index.ts",
+   "note": "Roster service: two-phase enter/announce publication, factory delegation, originator AsyncLocalStorage scope"
+  },
+  {
+   "path": "packages/core/agent/src/runtime-types.ts",
+   "note": "The Agent interface (7 methods) and the declarations and contracts for the 12 agent/* events"
+  },
+  {
+   "path": "packages/core/agent/src/inbox.ts",
+   "note": "Log projection, claim, and write validation for the next-turn / next-step pending lists"
+  },
+  {
+   "path": "packages/core/agent/src/consumed-work.ts",
+   "note": "Single-pass fold of the session log, reading out consumed work and input discarded unrun"
+  },
+  {
+   "path": "packages/core/agent/src/dispatch.ts",
+   "note": "Fused dispatcher: the Scoped carrier and the agent subject injected together, ruling out routing-key drift"
+  },
+  {
+   "path": "packages/core/scope/src/index.ts",
+   "note": "Scope minting, Symbol-key parent chain, event admission filter"
+  },
+  {
+   "path": "packages/core/scope/src/store.ts",
+   "note": "Layered storage: merged reads where the nearest layer along the chain overrides, plus effect ownership"
+  },
+  {
+   "path": "packages/core/tools/src/index.ts",
+   "note": "The real consumer of the layering: restrict intersects, local registrations exempt, hard validation at registration time"
+  }
+ ],
+ "related": [
+  "agent-loop",
+  "session",
+  "tools",
+  "preset"
+ ]
+}

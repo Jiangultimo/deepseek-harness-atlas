@@ -1,0 +1,220 @@
+{
+ "id": "session",
+ "lede": "Two hundred turns in, the context fills up and the system compacts itself. You scroll back through the transcript and the first hundred and eighty turns are gone, replaced by one line: \"summary of the conversation so far.\" Everyone who builds these systems runs into this: the history you feed the model has to be compressible, and the record a human reads can't lose a single word. One body of data, two requirements that fight each other. Stack two more headaches on top — what an old build should do when it reads a log written by a newer one, and how you pick things up after the process dies mid tool call. The three look unrelated. They're three faces of one decision: **this log is append-only. Nothing is edited in place, nothing is ever deleted; everything that looks like an edit or a delete is a view layered on top of it.**",
+ "packages": [
+  "packages/core/session",
+  "packages/session/session-persistence",
+  "packages/session/session-persistence-jsonl",
+  "packages/session/session-persistence-sqlite",
+  "packages/session/session-projection"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "One number, both identity and position",
+   "body": [
+    "There's an unglamorous choice in any event-stream system: where an event's id comes from.",
+    "The common answer is to mint a random id and keep a second table mapping ids to positions in the stream. Plenty of operations need to say \"from this one to that one,\" and an id alone can't locate anything.",
+    "Here it goes the other way: the sequence number an event takes on write is the current length of the log. So numbers start at 0 and run strictly consecutive, with no holes. History fed in during replay, forking, or crash recovery goes through the same check — the i-th entry's number must equal i, or construction fails outright.",
+    "One number is both identity and position. Everything downstream — range replacement, provenance references, how far a projection has read, the alignment check a backend runs on append — is expressed with that number alone. There's no second table to keep in sync.",
+    "Before anything gets written there's a screening: anything JSON can't express is refused — functions, cycles, infinities, negative zero, sparse arrays, and the \"looks storable, doesn't come back\" family like date objects and sets.",
+    "The interesting part is that validation and copying happen in a single pass — the moment a value passes it's copied into the new object, and then the whole tree is deep-frozen. That isn't about saving a traversal. It closes a hole: do it in two passes and a stateful getter can hand one value to the validator and a different one to storage.",
+    "The append itself is synchronous; it doesn't wait on the disk. It takes the listener list, pushes the event into the log, and only then calls back. That order means: once an event is in the log it's committed. A listener that throws gets logged and contained — it can't fail the append, and it can't block the listeners behind it.",
+    "Metadata stays out of the log — format version, creation time, working directory, which session is the parent, which preset is in use, how many levels of delegation deep. All of it hangs off a separate immutable registration record. The reason is plain: it isn't replayable conversation state. Replaying doesn't produce it again.",
+    "Consecutive numbering, write-once shaping, metadata kept out — those three together are what make \"the log is the truth\" true. **What a stream of facts really can't afford isn't losing data. It's the same record reading differently at two different moments.**"
+   ]
+  },
+  {
+   "heading": "What the model sees isn't what's in the log",
+   "body": [
+    "A long session has to be compacted. Nobody argues about that. The argument is about how compaction lands.",
+    "The standard move is to edit the message array directly: drop the old messages, drop in a summary. Quick and clean, and the cost is that the original conversation is gone — afterward nobody can answer \"what was actually said before the summary\" or \"which step painted over it.\"",
+    "Here an ordered view sits on top of the log — call it the model's field of view. Only the three kinds of event that turn into messages in a model request are eligible to enter it: user messages, assembled assistant messages, tool results. They have to declare how they enter. Everything else — streaming fragments, turn and step boundaries, purely record-keeping entries — is rejected if it declares at all, once by the type system at the call site and again at runtime.",
+    "There are exactly two ways in. One is append to the end, which is what ordinary conversation does. The other is \"replace everything from here to there in the current view with me.\"",
+    "The second comes with hard constraints: both endpoints must be nodes that actually exist in the current view, and the new node's provenance list must name every single node it covers over. Miss one and it's refused.",
+    "The point is that covering over isn't deleting. The covered events are still sitting in the log, whole. They just no longer appear in the string of messages the model sees.",
+    "The compaction plugin is written exactly that way: write a purely record-keeping summary first, then append a user message that covers the whole range, listing in its provenance the start of the range, the summary itself, and every covered node. Truncating oversized tool output takes the same road; the range just happens to be one node long.",
+    "Replacing a tool result narrows further: strictly one for one, the target must also be a tool result, and after hollowing out the content field on both sides everything else must compare deep-equal. Translated: a rewrite may change the content and nothing else — it can't swap out which call this is, and it can't quietly turn into something else.",
+    "**Compaction becomes an auditable act — who covered what, at which step, reads straight out of the log. No separate audit trail to maintain.**"
+   ]
+  },
+  {
+   "heading": "One log, two readings",
+   "body": [
+    "Back to the headache from the top: the model's history has to shrink, the human's record can't.",
+    "A lot of products solve it by keeping two copies — a raw record for the interface, compacted messages for the model. Two datasets, two write paths, and then the weird bugs start: things the interface has that the model doesn't know about.",
+    "Here both readings share one log, and the rule is almost comically plain: the human-facing record reads only the events that were appended to the end, and skips every node a range replacement produced.",
+    "The reasoning is symmetric. A replacement node is a retelling meant for the model; it trades a whole stretch of conversation for one summary. If the human interface took it at face value, conversation the user demonstrably read would vanish the instant compaction landed. In the other direction, the covered original events no longer exist for the model, but for the human record they're still the raw material.",
+    "The rule is written as two predicates that are each other's opposite, and exported from the client runtime. Pagination counts by the same rule: replacement nodes don't consume the quota, the cut point is the starting number of the oldest group of messages, and group boundaries are derived from the provenance lists. So it never cuts through the middle of a message, and a compaction's summary and its replacement node are guaranteed to land on the same page.",
+    "Folding events into messages is a pure function, advancing node by node. User messages pass through unchanged — any wrapper text is baked into the content by whoever produced it, and the fold adds no shell of its own. Assistant messages with empty content are skipped outright; that kind is just a husk carrying one step's token counts, and the model shouldn't be handed an empty turn. Tool results yield their message body.",
+    "Deriving the current history for a live session and replaying an entire log offline call the same function. That matters more than it looks: with two copies of the fold logic, they drift eventually, and drift shows up as \"can't reproduce it outside production\" — the hardest kind to chase.",
+    "**Whether a log deserves to be called the truth comes down to one thing: can it reproduce, exactly, what any past request saw at the time.**"
+   ]
+  },
+  {
+   "heading": "Refuse what you don't recognize — don't skip it",
+   "body": [
+    "The event types are open: a plugin can add its own to the table. Everything that costs is on the read side — what should an old build do when it reads a type it doesn't recognize.",
+    "Nearly every system's default answer is: skip it. Skipping is gentle, forward-compatible, doesn't bother anyone. The default answer here is to refuse to rebuild the session at all.",
+    "The reasoning is written into the event envelope's contract: one unrecognized required event can change how everything after it should be interpreted — it might, for instance, be a range replacement. Skipping it raises no error and quietly rebuilds the wrong session.",
+    "The escape hatch is an \"ignorable\" mark on the envelope. Only the writer can set it, and only on purely informational entries whose loss doesn't affect the rebuild.",
+    "Defaulting to required means the consequence of forgetting the mark is over-refusal — inconvenient, but visible — rather than quietly missing a piece, which is wrong and invisible.",
+    "The check reads off a static list of \"which types this build knows,\" generated by a script and kept fresh by a documentation gate. It runs after events are normalized, so the specific diagnostics for various older shapes don't get buried under this one generic refusal.",
+    "The format version is a second gate, and the rule is stated rigidly: whether to bump the version is decided by what the writer produces, not by whether a reader can parse it.",
+    "That rule is worth a second look. Parsing isn't interpreting — an old build reading a new range-replacement event as an ordinary event raises no error at all, but the conversation it rebuilds is wrong. Pegged to reader ability, the criterion isn't even executable: nobody can enumerate whether every old version can read it.",
+    "So only four kinds of structural change bump the version: the registration record's structure, the event envelope, core event semantics, the field-of-view mechanism. Adding an ordinary event type doesn't; the ignorable mark covers that.",
+    "The current version is pinned at 0 — no compatibility promise, no migration. A mismatch refuses to open, and the wording points in a definite direction: a newer log tells you to upgrade the program, an older one tells you this build has no migration path.",
+    "**The cost of refusing by default is one visible failure. The cost of skipping by default is an invisible wrong state. Those aren't the same order of magnitude.**"
+   ]
+  },
+  {
+   "heading": "The core shouldn't know how anything gets to disk",
+   "body": [
+    "The easiest way to write storage is to weld it into the core: while you're appending, write a line out. Shortest thing to write, and then you can never swap it out.",
+    "Here the core emits three signals only: a session was created, an event arrived, and a checkpoint that has to be waited on before it's durable. Backends are plugins; subscribing to those three is enough.",
+    "The abstract service spells out what a backend must be able to do: register metadata, append a batch of events, read back a balanced logical view, inspect without modifying, read the suffix from a given number, list sessions, list snapshots with a change token.",
+    "A change token is an opaque string the backend owns: observing the same unchanged log twice yields the same value, and tokens from different sources are never compared against each other. It lets list pages and caches tell whether anything moved without parsing the whole log.",
+    "The first-party backends share one piece of orchestration, and it's all timing that's easy to get wrong. Serialized per session id, so writes to the same session never interleave; every event is cloned into its own queue first, and the disk write is batched in the background.",
+    "The batch window is two hundred milliseconds by default: the clock starts when the queue goes from empty to non-empty, and the write goes out when it expires. An explicit flush cancels the wait and drains until quiet, and concurrent flushes share one barrier. When a batch fails to write, its events go back to the head of the queue in their original order and the automatic window pauses — nothing reordered, nothing dropped.",
+    "There's a detail on the unload path that is very easy to miss: the cleanup action that drains the queue has to be registered before the listeners. The runtime tears down in reverse registration order, so the event entrance closes first, and that final drain runs knowing no new events can arrive.",
+    "On the read side there's another layer, a projection registry: a domain plugin hands over three pure functions — initial value, per-event transition, take a view — plus a state version number, and the framework handles subscribing, caching per session how far it has read, and notifying when the state reference changes.",
+    "That state version number is what invalidates the persistent cache. Rows from an older version get thrown away and refolded rather than stacked on top — what stacking produces is garbage, and the kind of garbage that doesn't raise an error.",
+    "**Making storage a seam buys more than the abstract \"you can swap backends.\" The real payoff is that the whole pile of timing traps only has to be gotten right once, and every backend shares that answer.**"
+   ]
+  },
+  {
+   "heading": "Most of the log is envelope, not content",
+   "body": [
+    "Streaming output is the main source of log bloat, and the ratio will surprise you.",
+    "The model spits out fragments token by token, and every fragment gets wrapped in a JSON envelope — which turn, which step, what block index, what timestamp. Measured on real sessions: the envelope runs about fifty-six times the payload. Which is to say, untreated, most of what's in the log isn't what the model said. It's the fact of \"this is a fragment\" restated a few tens of thousands of times.",
+    "The usual move is to stitch consecutive fragments into one finished piece of text and store that. Easy, and the token boundaries are gone — and token boundaries are themselves data. Playback needs them to reproduce the original rhythm.",
+    "A third road is taken here: pack, don't stitch. Consecutive fragments from the same turn, same step, same block index get packed into one row. The row records the number and time of the first member, stores only time deltas between members, and keeps every payload separately. Text, reasoning, and tool arguments each get their own kind of row.",
+    "Packing is lossless. The encoder only recognizes exact shapes on a whitelist; anything it doesn't fully recognize is stored as-is — what's lost is compression ratio, not data. The decoder validates before expanding, and a malformed row raises rather than silently swallowing a whole stretch.",
+    "It takes at least three in a row to pack, and that's a hardcoded format constant, not a knob. The reason is practical: both arrangements decode identically, so making it a parameter would only manufacture two answers that are both right.",
+    "The two backends part ways here. One is a text file per session: the first line is the registration record, every line after it is one entry, with a compression frame wrapped around the whole thing by default. Reading scans bytes for newlines and decodes only complete entries; a trailing entry with no newline is treated as a torn tail and ignored, along with a byte offset it's safe to resume writing from.",
+    "Its tolerance for damage is graded: if a line in the middle fails to parse or the numbering skips, it records the problem and stops taking events. But if some line further on contains a turn-end event, it throws outright — that would mean a turn already fully committed getting quietly dropped, which is not the same thing as a torn tail.",
+    "There's an unglamorous, lethal detail too: the session id is an unvalidated string, and it has to be encoded before it goes into a path. The escape used is injective over all strings — safe characters unchanged, everything else becoming a tilde plus four hex digits, with single and double dot special-cased — which blocks path traversal and filename collisions in one move.",
+    "The other backend maps the registration record and the events onto rows in relational tables, with no per-session file. The tables are strict-mode, carry a fixed marker so it can't write into the wrong database, and the schema version increases monotonically with no in-place migration; a mismatch is refused. The two backends align deliberately on one point: whether a session row exists is the \"materialized\" signal, written on first append, so a session that was created but never written leaves no trace — the same thing as the text backend only creating a file on first append.",
+    "**The real divide isn't file versus database. It's whether it can seek by number. The one that can implements an addressable suffix read; the sequential medium has to parse the whole thing and skip forward — and that difference seeps all the way up into how much each one refuses.**"
+   ]
+  },
+  {
+   "heading": "After it dies halfway through",
+   "body": [
+    "When the process dies mid-turn, the log stops somewhere unbalanced: the turn is open, the step is open, some tool calls went out and never got results.",
+    "The common handling is to throw that stretch away and restart from the last clean point. Simple, and the cost is that the half turn the user already watched vanishes, and the model has no idea where it left off.",
+    "Here it's filled in instead: on rebuild, a deterministic run of closing events is appended. First an error tool result for every dangling call, then the boundary closing the open step, and finally a turn-end that says it ended because of an interruption.",
+    "The order isn't arbitrary. The model provider will flat-out reject a conversation with dangling calls, so the tool results have to come first; and declaring the turn over while a step is still open violates the log's own relational constraints. Squeezed from both ends, the order is forced.",
+    "The synthesized error results come in two wordings, depending on whether the call had been recorded as started when the crash hit. One that never started simply tells the model to retry if it needs to. One that started but whose result never reached disk says the result is unknown, and asks the model to judge by the tool's own semantics: read-only or idempotent is safe to retry, anything with possible side effects should be checked against external state or raised with the user first, not blindly retried.",
+    "**That wording is a runtime instruction written for the model, not an error message written for a person.** If the log is model-visible input, every sentence in it has to be designed as input.",
+    "The synthesized events take the next numbers in the log, and reuse the timestamp of the last real event — no inventing future times, so repairing the same crashed log any number of times gives the same result. A related rule: loading is refused when the session is already live with an open turn. You don't get to run crash repair on an identity that's still alive.",
+    "Branching a new session from a midpoint is the same set of constraints put to another use. The boundary is an inclusive number, which has to exist and be consecutive; omit it and you get the current last entry. The hard constraint is that the prefix can't stop inside an open turn — the implementation walks back to the nearest turn boundary, and refuses if what it finds is a turn start.",
+    "Every refusal carries a type code: source session doesn't exist, source isn't that live instance, child id already taken, boundary illegal, turn not closed. The child's registration record notes who the parent is and how many events were inherited, and that durable fork boundary lets later rebuilds tell \"history I inherited\" from \"work I did myself.\"",
+    "In-process there's an even finer line: the length of the seed at construction. Where the seed ends gets projected into a marker event in the log, which read-only consumers use to locate the boundary; a seed that already ends with that marker isn't marked again, so opening an untouched session over and over doesn't make its log grow.",
+    "Put crash recovery, forking, and seed boundaries side by side and you find they're handling the same thing — **in an append-only log, \"which stretch did I do\" has to be stated by the log itself, not remembered by whatever process opened it.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Cover it over, don't delete it",
+   "how": "Standard history compaction just edits the message array: drop a stretch of old messages, drop in a summary. Shortest thing to write, but what was said before the summary is gone for good. This goes the other way: the node compaction produces declares \"replace everything from here to there in the current view with me.\" Both endpoints have to be nodes that actually exist in the view, and its provenance list has to name every single node it covers; miss one and it's refused. The covered events are still lying in the log intact, they just stop entering the string of messages the model sees. The difference: one is loss, the other is occlusion.",
+   "why": "Deleting destroys more than data. It destroys auditability and the human record, two things that have to coexist. Occlusion makes \"who covered what, at which step\" readable straight out of the log, with no separate audit trail to build."
+  },
+  {
+   "name": "Compute the whole change before touching state",
+   "how": "The standard way is to validate and mutate as you go: check a piece, change a piece, roll back when something goes wrong. Rollback code is a second body of logic, and it's always tested less than the forward path. Here a candidate event is worked out as one complete state transition first — validate the shape and type eligibility it declares, validate that every provenance number is older than its own and not repeated, locate the replacement range in the current view, work out which nodes actually get covered — and only after all of that does the view state change. A rejected append leaves no half-modified view, because it never started modifying. Incrementally maintaining a live session and replaying a whole log run the same code.",
+   "why": "No second body of logic for rollback, and with both paths sharing one set of checks there's no room to drift."
+  },
+  {
+   "name": "Hit something you don't recognize and stop entirely",
+   "how": "Open event types inevitably bring a forward-compatibility problem, and nearly every system answers it by skipping records it doesn't recognize. This inverts that: the read path takes a static list of \"which types this build knows\" and compares entry by entry; an event it doesn't recognize that the writer hasn't marked ignorable refuses the rebuild of the entire session, with a note that the log may come from a newer program. The ignorable mark is set only by the writer, only on purely informational entries. The check runs after events are normalized, so this generic refusal doesn't bury the specific diagnostics for various older shapes.",
+   "why": "One unrecognized required event can change how everything after it should be interpreted — it might be a range replacement itself. Skipping it raises no error at all, but the session it rebuilds is wrong."
+  },
+  {
+   "name": "Pack token-by-token fragments into one row",
+   "how": "There are two usual ways to store streaming fragments: one row each, as-is, or stitch them into finished text first. The first turns the log into an ocean of envelopes; the second throws away token boundaries. A third is taken here: consecutive fragments from the same turn, same step, same block index pack into one row, which records only the number and time of the first member, stores time deltas between members, and keeps each payload separately without stitching. The encoder only recognizes exact shapes on a whitelist and stores the rest as-is — losing compression ratio, not data; the decoder validates before expanding, and a malformed row raises. At least three in a row to pack, hardcoded into the format rather than exposed as a parameter.",
+   "why": "Measured on real sessions, a fragment's JSON envelope runs about fifty-six times its payload. Without packing, most of the log is \"this is a fragment\" restated a few tens of thousands of times."
+  },
+  {
+   "name": "Validate and copy in a single pass",
+   "how": "The standard way is to run a validation pass, then deep-copy for storage once it passes. Two passes, easy to read. The problem is the instant in between: a stateful getter can hand the validator a legal value and the copy an illegal one, and what lands in the log doesn't match what was validated. Here both happen in one recursion — recognize a non-JSON value and refuse the whole thing, copy what passes into the new object on the spot — and then the whole tree is deep-frozen. What comes back to the caller is the snapshot that went into the log, not the original the caller can keep editing.",
+   "why": "The one thing a log that claims to be the truth cannot tolerate is that what it recorded and what it validated are not the same thing."
+  },
+  {
+   "name": "A deterministic closing for the crash scene",
+   "how": "The usual handling of a mid-flight crash is to discard the incomplete stretch and restart from the last clean point, at the cost of content the user already saw disappearing and the model not knowing where it left off. The choice here is to append instead: scan out the open turn, the open step, and the calls that went out without results, then fill in a fixed order — one error result per dangling call, then the step end, then a turn end that says it ended because of an interruption. Numbers continue from the log, timestamps reuse the last real event. The order can't be swapped: the model provider rejects a conversation with dangling calls, and ending a turn while a step is still open violates the log's own relational constraints.",
+   "why": "Timestamps invent no new values, so repairing the same crashed log any number of times gives the same result — recovery is itself reproducible, not voodoo that comes out a little different each run."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Make readers refuse unrecognized records by default, instead of skipping them by default.",
+   "why": "The cost of skipping is quietly rebuilding a wrong state that nobody notices; the cost of refusing is one visible failure. Then make \"ignorable\" a mark the writer sets explicitly, and forgetting the mark produces over-refusal instead of silent corruption — biasing errors toward the visible side is the only room you get in this kind of design."
+  },
+  {
+   "lesson": "Compact history by occluding, not by deleting.",
+   "why": "Once it's deleted you can never again answer \"what was there\" or \"who covered it.\" Occlusion splits the two requirements that fight each other: the model reads the compacted view, humans read the raw append stream, both off the same log. No second store to maintain, and therefore none of the bugs where two copies disagree."
+  },
+  {
+   "lesson": "Whether to bump the version is decided by what the writer produces, not by whether a reader can parse it.",
+   "why": "Parsing isn't interpreting. An old build reading a new range-replacement event as an ordinary event raises no error, but the conversation it rebuilds is wrong. Pegged to reader ability, the criterion isn't executable at all — nobody can enumerate whether every old version can read it."
+  },
+  {
+   "lesson": "Write the folding rule once, and share it between the live path and offline rebuild.",
+   "why": "The entire value of a session log is that whatever any past request saw can be reproduced exactly. Write it twice and the two drift eventually, and drift shows up as \"can't reproduce it outside production\" — the hardest kind of bug there is, because you don't even have a trustworthy reference to compare against."
+  },
+  {
+   "lesson": "Making storage a seam isn't about swapping backends. It's about getting the timing traps right once.",
+   "why": "Serialization, the batch window, ordered requeue on failure, reverse teardown order at unload — every one of those is easy to get wrong, and getting it wrong doesn't raise immediately; it shows up intermittently under load. Fold them into one shared orchestration and a new backend only implements the part that's genuinely its own, instead of reinventing the timing."
+  }
+ ],
+ "tradeoffs": [
+  "The format version is pinned at 0, with no compatibility promise and no migration; a mismatch simply refuses to open. That's a deliberate pre-release choice with a very real cost: any structural change invalidates every existing session. It stays valid only until the first tagged release.",
+  "The whole log lives in memory — the event array, the snapshot array, the folded message cache, all in-process. Message derivation is cached per node, but one range replacement rebuilds the cache wholesale. Memory for a long session grows linearly with event count. There's no windowing.",
+  "Locating a replacement range uses linear search, so each replacement is linear in the number of nodes in the current view. It doesn't matter while the view is small, but this is a cost that grows with session length rather than a constant — that it doesn't hurt now doesn't mean it never will.",
+  "The scope of unknown-type refusal differs between the two backends: the one that can seek by number checks only the suffix it returns, while the sequential medium parses the whole file and errors on an unknown event anywhere in it. The code admits the asymmetry outright — better over-refusal on the sequential side than widening the range of a seeking read.",
+  "Which event types are known comes from a static list generated inside the repository, so events declared by plugins outside it are inherently absent and will always trigger a refusal. An entry point for external plugins to register event types is explicitly deferred until there's a real consumer, which amounts to admitting the openness currently only holds inside the repository.",
+  "Write-back has a two-hundred-millisecond batch delay by default, and a turn ending doesn't wait for the disk; a separate checkpoint plugin sets a barrier before each request. On paths where no checkpoint intervenes, a crash loses whatever is inside that window. Separately, an observer failing is logged and not rolled back — the log itself doesn't get polluted, but external projections and storage can be briefly out of sync with it."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/core/session/src/index.ts",
+   "note": "Append's commit-and-publish path, plus store and fork"
+  },
+  {
+   "path": "packages/core/session/src/types.ts",
+   "note": "Event table, envelope, surfaceOp, and format version"
+  },
+  {
+   "path": "packages/core/session/src/surface.ts",
+   "note": "View folding, replacement validation, per-event projection"
+  },
+  {
+   "path": "packages/core/session/src/repair.ts",
+   "note": "Deterministic closing events for a crashed log"
+  },
+  {
+   "path": "packages/core/session/src/chunk-rows.ts",
+   "note": "Lossless packing and expansion of streaming deltas"
+  },
+  {
+   "path": "packages/session/session-persistence/src/coordinator.ts",
+   "note": "Shared orchestration for write-back, adaptation, and unknown-type refusal"
+  },
+  {
+   "path": "packages/session/session-persistence-jsonl/src/format.ts",
+   "note": "Path encoding, header line, torn-tail scan"
+  },
+  {
+   "path": "packages/session/session-persistence-sqlite/src/schema.ts",
+   "note": "SQLite table structure and the schema version gate"
+  }
+ ],
+ "related": [
+  "agent-loop",
+  "compaction",
+  "agent",
+  "web-client"
+ ]
+}

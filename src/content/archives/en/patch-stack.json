@@ -1,0 +1,228 @@
+{
+ "id": "patch-stack",
+ "lede": "You install an agent product and it runs out of the box. You want to swap the model — change this one line, leave everything else alone.\n\nMost products hand you a default config at this point: here, all eighty lines of it, edit away. You change three lines. Six months later the product ships an upgrade, the defaults grow to a hundred and twenty lines, your three lines collide with the new ones, and you're doing a three-way merge by hand — and worse, you long ago lost track of which lines you actually touched.\n\nThis thing took another road. Its root config is an empty list. Not empty to start with — wiped back to empty on every launch. The plugin tree that actually runs is computed in one shot, from a stack of diff layers flattened in a fixed order.\n\n**Defaults shouldn't be a file waiting for you to edit it. They should be the bottom layer of the diff stack.**",
+ "packages": [
+  "apps/cli",
+  "packages/boot/app-boot",
+  "packages/boot/cmdline",
+  "packages/bundle/base",
+  "packages/bundle/headless",
+  "packages/bundle/web-app",
+  "vendor/include",
+  "examples/headless-agent"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "The root config is empty, and gets wiped again on every launch",
+   "body": [
+    "Booting a profile is, to put it plainly, booting a folder in your home directory.",
+    "Three things live in it: a dependency manifest (which also carries an ordered list of layer names), a diff file that belongs to you, and a root config.",
+    "That root config always holds the same thing: an empty list, plus one comment line telling you to edit the diff file next door and leave this one alone.",
+    "Fine, it's empty — so why rewrite it on every launch?",
+    "Because the config loader underneath has a write-the-tree-back path: when a plugin unloads itself, it persists the entire tree in effect at that moment back to the file.",
+    "Nothing's wrong with that path in itself — it lets runtime changes land on disk. But for a composition scheme where everything is computed, it's a disaster: the few dozen lines computed last time get written into the root file, then the next launch stacks every layer's insertions on top again, and the line count doubles.",
+    "So before every launch, wipe it back to empty.",
+    "Then why not just let the file not exist? Because the loader needs a real include root to anchor relative paths against this folder. The config preview anchors to the same file — so both paths press down on exactly the same base.",
+    "The cost is honest: any edit you make directly to this root file is silently erased on the next launch. That one comment line at the top is the only warning.",
+    "**A file can stay on disk not because it has content, but because something has to be the origin point.**"
+   ]
+  },
+  {
+   "heading": "If layers can't change layers, what you have isn't layers",
+   "body": [
+    "The place layered config most often goes off the rails isn't which layer wins over which. It's that a later layer wants to change something an earlier layer just added, and finds it can't target it at all.",
+    "The usual approach is to apply layer by layer: compute the first layer's result, patch it with the second, then patch that with the third. Sounds natural, and often it does work — right up until you need \"layer one inserts a line, layer three configures it, layer four disables it.\"",
+    "The approach here is to flatten first, then compute.",
+    "The order is fixed at five segments: every shipped layer on the list (in list order), this profile's own diff file, the diff file in your home directory, override files stacked on from the command line (in the order given), and finally the two the launcher derives itself. All of it is concatenated into one flat array first, and then the patch algorithm is called exactly once.",
+    "The algorithm builds an identifier index over the existing lines first, then works through each patch in order. Here's the key part: a newly inserted line enters the index on the spot. So later layers can configure, and can disable, a line an earlier layer just inserted.",
+    "One detail in that order deserves its own mention: the home-directory layer sits after the profile's own. It's a machine-level preference that applies across all your profiles, so it should win over any single profile; what you pass on the command line wins over that; the launcher's derived entries sit on top, where your edits can't push them out.",
+    "The two derived entries are restrained too. One pins the factory preset directory into the preset roster line — that directory sits alongside this app's config, and only the launcher itself can resolve it. The other is the privacy switch: as long as that environment variable is non-empty, even if the value is the string \"0\" or \"false\", it appends a patch disabling telemetry to the top of the stack. Better to turn it off by mistake than to leave it on by mistake.",
+    "And if the current profile has no telemetry line at all, that patch isn't generated — a custom profile doesn't have to bolt on telemetry just to make the switch work.",
+    "How concrete does this get: the base layer is a single insertion, laying out seventy-eight lines of core plugins in one go. The mode layer for running a single task is only thirty-five lines — rewrite one sentence of the persona, turn off module hot reload, flip a switch, insert three lines of its own.",
+    "**Everything that makes a mode a mode is those thirty-five lines of diff.**",
+    "A computed tree still isn't a running tree. So once the whole tree settles there's a line-by-line audit: a line that neither actually came alive nor was explicitly disabled means the module never resolved at all; a line in a failed state gets the original stack the plugin threw retrieved; a line still pending gets a list of which services it's waiting on that never showed up. All the failures are collected into one thrown error, carrying the stack of the deepest cause, rather than a paraphrase wrapped layer over layer.",
+    "\"Flatten, then compute once\" isn't a performance optimization. **If later layers can't change what earlier layers added, what you have isn't layers — just a few config files that don't know about each other.**"
+   ]
+  },
+  {
+   "heading": "A plugin package can contain zero lines of code",
+   "body": [
+    "The phrase \"plugin package\" naturally makes you assume there's code inside waiting to be executed.",
+    "And the usual approach is exactly that: install an extension package, the loader pulls it in as a module, and it hangs things onto the framework from its own registration entry point. Which is to say, \"loading an extension\" and \"executing third-party code\" are the same act.",
+    "The layers here aren't like that. A layer is an ordinary dependency package whose entire content is one line in its manifest, pointing at a diff file inside the package. The base layer package's source entry point is a single empty export, and the module docs say it outright: this package has no runtime interface.",
+    "The composer never loads it as a module. It does three things: resolve the package name to a directory, read that directory's manifest to get the diff file's relative path, and read that file in as plain text and parse it.",
+    "In other words, loading a layer executes not one line of that layer's own code. Adding, removing, and replacing layers is a pure data operation.",
+    "So who are the seventy-seven dependencies in the base layer's manifest for?",
+    "For module resolution. At startup there's a flat symlink repair pass: starting from the app manifest, walk the entire closure of dependencies and peer dependencies breadth-first, and create a symlink for every package under one shared directory. When the runtime searches upward from any profile directory for a module, it hits this directory right after its own. So every shipped plugin resolves, without the package manager having to manage them.",
+    "Peer dependencies have to be counted in. Capability-definition packages are peer dependencies of the implementation packages rather than ordinary dependencies, and external plugins reference them directly — miss that class and third-party plugins won't install.",
+    "Layer package-name resolution is still double-anchored: look under this installation first, then under the profile directory. That order is itself a rule: shipped layers always come from this installation, never from some stale copy left behind in a profile directory.",
+    "The profile's own plugin management is a thin forwarding layer: the arguments go straight to the package manager running inside the profile directory, and on success the layer list is reconciled against \"what's installed now\" rather than \"what's missing from the dependencies.\" If a package only adds its layer declaration in a newer version, the next update joins it to the layer stack automatically.",
+    "**When a layer has no code in it, \"swap out a layer\" really is just swapping out a layer.**"
+   ]
+  },
+  {
+   "heading": "The launcher shouldn't know the app's flags",
+   "body": [
+    "One launcher has to launch several kinds of app, each with its own pile of arguments.",
+    "The usual approach is to make the launcher know all of them: parse its own, then hand the rest off by some rule. The problem is that \"some rule\" always misses something. Adding an app means changing the launcher; colliding flag names on the two sides need someone to adjudicate; and the help text has to be maintained a second time inside the launcher.",
+    "The approach here is blunt: the launcher knows four flags — which profile to pick, which override files to append, and two config-preview switches. From the first word it doesn't recognize onward, everything belongs verbatim to the app being launched.",
+    "It's implemented with four settings on the command-line parser: turn off the built-in help flag, allow unknown options, enable pass-through, enable positional options. So asking for help with a profile name prints that app's own help; and a bare help request, with no profile to hand off to, prints the launcher's.",
+    "One trap deserves its own mention: the flag that appends override files uses a repeatable single-value collector, not a variadic argument. A variadic would swallow the inner arguments that follow it whole.",
+    "The remaining stretch of arguments is frozen into an immutable snapshot and published to the root context as an ordinary service, before a single plugin line is mounted.",
+    "\"Ordinary service\" is the important part. Any plugin can inject it, parse its own family of flags with its own parser, print its own help, throw its own errors. The launcher holds no knowledge of any app's flags.",
+    "Or push it one step further: a plugin can publish its own parse result as a service too, and then one ordinary config line injects that service and writes a lazily evaluated expression right there in the config — take the port from the service, fall back to the default if it isn't there. So a command-line flag wins over the default written next to it, and no line gets launcher-level privilege for it.",
+    "Requesting process exit follows the same pattern: it's a launcher fact, published as a service the same way, bound to a bounded shutdown controller.",
+    "**The best way to handle a privilege is to demote it into an ordinary service anyone can inject.**"
+   ]
+  },
+  {
+   "heading": "A preview written a second time will lie eventually",
+   "body": [
+    "The most maddening thing about layered config is that you can't see the result. What does it actually look like after five layers press down? Who wrote this line?",
+    "So systems like this all ship a \"print the final config\" command. And that command is almost always implemented a second time: read the files again, merge them again, print them again.",
+    "The moment there are two algorithms, they drift. And drift shows up in exactly one place — the user edits their config to match the preview, and the run comes out different. At which point nobody suspects the preview.",
+    "The preview here goes through the same flattening logic, the same parsing and printing of the same config grammar, with lazily evaluated expressions printed as written rather than evaluated.",
+    "It also refuses to carry app arguments. The reasoning is flat: the preview doesn't start the tree, so it can't see what those flags would decide; printing a tree that differs from what the same command actually runs is worse than printing nothing.",
+    "Source attribution uses a method that's dumb but accurate: prefix snapshot diffing.",
+    "For every prefix length, do one \"press only these leading layers, apply once\" pass, and compare the result against the previous one line by line, by index. An index that's newly appeared came from the layer just added; an index whose content changed gets that layer appended to that line's \"who modified this.\"",
+    "This holds only because the patch algorithm can only rewrite an existing line in place or append after it, so a top-level index identifies the same line across snapshots. That's also its ceiling: an insertion inside a group can only be marked \"this layer changed this line,\" with no finer position visible within the group.",
+    "Warnings for patches that hit nothing fall out of the same snapshots — each warning list is an extension of the previous one, and the tail that just grew belongs to the layer just added. So the preview can print warnings to standard error with a layer tag attached.",
+    "Output is grouped by runs of the same tag, with each group preceded by a comment line naming the source file and the layers that modified it, and the whole thing is still a config you can load directly. There's also a mode that prints only the shipped layers and doesn't parse the user layers at all — that's the recovery diagnostic for after you've broken your own diff file.",
+    "**A config preview that doesn't reuse the real path eventually becomes a lie told in an authoritative voice.**"
+   ]
+  },
+  {
+   "heading": "Some variables have no business being in the file layer",
+   "body": [
+    "Layered loading of environment variables is a very common feature: the inherited process environment wins, then the env file in your current directory, then the one in your home directory.",
+    "The usual approach is to read down the priority order and use whatever you find.",
+    "But there's a class of variable that rarely gets taken seriously — it isn't \"config\" at all, it's part of how this process gets built in the first place.",
+    "For instance: the one that decides where executables are found; the one that decides what arguments the runtime starts with; the one that can preload a library during dynamic linking; the startup hooks for various interpreters (bash, Python, and Java each have one); the version-control tool's command hooks and config redirection, including which remote-login command it uses, which global config it reads, which editor it invokes; plus proxies, CA certificates, the TLS verification switch, and the model service address.",
+    "If a file that can be pulled into a project along with the code can set these, then cloning a repository amounts to letting it change where your process loads code from, and how it reaches the network.",
+    "So there's a rejection list here, split into exact names and prefixes. The four prefix groups block the product's own namespace, the desktop standard directories, macOS's dynamic linker, and bash's function exports. Rejecting the product's own prefix also means, in passing, that files like this can't move the home directory or change the permission mode.",
+    "The handling deserves attention too: both files are parsed completely first, then applied together. A rejected name in either one throws for the whole thing — never leaving a \"one file half-applied\" state behind.",
+    "Values that are accepted don't override an inherited value of the same name either. The whole set of source information is packed into a frozen snapshot and published to the tree before a single plugin line is mounted, so every plugin reads startup-time environment values from the same snapshot, provenance included.",
+    "There's one last backstop: a late unhandled rejection gets written as a single prefixed line to standard error, exit code 1. Before exiting it gives the terminal's owner one chance to hand the terminal back, capped at two seconds — a stuck cleanup can only delay this fatal exit, not cancel it. The diagnostics go out before the handback, so a failed cleanup can't swallow the reason.",
+    "**The first question in layered config isn't \"who wins over whom.\" It's \"what has no business being in the file layer at all.\"**"
+   ]
+  },
+  {
+   "heading": "The user layer is live, and the cost hides in the second reload",
+   "body": [
+    "On a long-running interface, both user diff files sit under a file watcher. You change a line in your editor and save, and it takes effect on screen.",
+    "The usual approach is to turn that change into an incremental patch and apply it to the current tree. Easy, and fast.",
+    "Not here. Any edit triggers a full restack: shipped layers still at the bottom, override layers still on top, your edit still in the middle. So your edit can never push out the two layers above it, and can never change the order below it.",
+    "Every generation re-reads both user files, even though the watcher only hands back the one that changed. Two watchers each reading their own file means neither stitches in the other's stale copy.",
+    "Then the real trap: every generation also has to deep-copy the entire patch set.",
+    "Because inserted lines are pushed into the mounted tree by reference, and later patches that hit by identifier modify those objects in place. Reuse one parse result and a single override of yours gets baked into the shipped layer's in-memory line — delete the override and you still can't get back to the default.",
+    "This class of problem is perfectly fine on the first reload. It only shows itself on the second.",
+    "There's one piece of backfill that says a lot: the single-task mode and the web mode both disable the shared module-hot-reload line (its reload lifecycle is untested). So those two profiles have no hot-reload service at all, and the \"config files hot reload\" promise fails silently — no error, it just doesn't happen.",
+    "So when the launcher finds that service missing from the tree, it mounts a replacement instance with an empty module root that watches files only (mounting a timer first if needed). Edits to the diff files are therefore live on every long-running interface.",
+    "**A contract that some profile can silently cancel was never a contract. Those few lines of backfill are what turn it back into one.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "An empty root config, rewritten on every launch",
+   "how": "The usual approach is to generate a default config, leave it sitting there, and let you edit it. This inverts that: the root config always holds an empty list, and it gets rewritten to that same content before every launch, with the real plugin tree computed entirely from the diff layers above it. The rewrite isn't fastidiousness — the loader underneath has a write-the-tree-back path, and when a plugin unloads itself it persists the whole tree in effect at that moment back to the file. Without the rewrite, the few dozen lines computed last time stay on disk, the next launch stacks every layer's insertions on top again, and the line count doubles. The file survives at all only because the loader needs a real include root to anchor relative paths.",
+   "why": "Composed lines never get baked onto disk, and the preview and the real launch anchor to the same file, pressing down on exactly the same base."
+  },
+  {
+   "name": "Flatten five layers, apply once",
+   "how": "The usual layered config applies layer by layer: compute the first layer's result tree, patch it with the second, and so on. Here every layer is concatenated into one flat array first, and then the patch algorithm is called exactly once. The order is fixed: every shipped layer on the list, this profile's own diff, the home-directory diff, override files stacked on from the command line, and the two the launcher derives itself. The algorithm builds an identifier index over the existing lines before working through them in order, and a newly inserted line enters the index on the spot. So the third layer can configure the line the first layer just inserted, and the fourth can disable it. The patch semantics themselves are tiny: hit by identifier and the whole key is overwritten; carry an insertion and it's appended after.",
+   "why": "\"Later layers can change the line an earlier layer just inserted\" is the one precondition that makes multi-layer composition work at all; the config preview reuses the same logic, so the two sides can't drift apart in meaning."
+  },
+  {
+   "name": "Layers are pure data; loading one executes no code",
+   "how": "The usual extension package has to be loaded as a module and hangs things onto the framework from its own registration entry point — loading an extension and executing third-party code are the same act. A layer here is just an ordinary dependency package whose entire content is one line in its manifest, pointing at a diff file inside the package; the base layer package's source entry point is a single empty export. The composer never loads it, and does three things: resolve the package name to a directory, read the manifest for the relative path, and read the diff file in as plain text and parse it. Those seventy-seven dependencies aren't for the composer, they're for module resolution — at startup the entire closure of dependencies and peer dependencies is walked breadth-first, with a symlink created for each one under a shared directory.",
+   "why": "Swapping a layer, deleting one, adding one — all pure data operations, with nobody's code executed along the way. Peer dependencies have to be counted in, because capability-definition packages are peer dependencies of the implementation packages rather than ordinary dependencies, and external plugins reference them directly."
+  },
+  {
+   "name": "The launcher knows four flags",
+   "how": "The usual approach makes the launcher know every flag, parsing its own and handing the rest off by some rule — adding an app means changing the launcher, name collisions need adjudicating, and the help text gets maintained a second time. The border here is drawn by four settings on the command-line parser: turn off the built-in help flag, allow unknown options, enable pass-through, enable positional options. From the first unrecognized word onward, everything belongs to the app being launched. The flag that appends override files uses a repeatable single-value collector rather than a variadic argument, which would otherwise swallow the inner arguments whole. The remaining stretch is frozen into an immutable snapshot and published as an ordinary service before a single plugin line is mounted.",
+   "why": "The app owns its own flag family, help text, and errors; a config line that injects this service can write a lazily evaluated expression, letting the command line win over the default written next to it, with no line getting launcher-level privilege."
+  },
+  {
+   "name": "Prefix snapshot diffing, to work backward to each line's source",
+   "how": "To know which layer each line in the final config came from, the usual approach attaches a source tag to every value during the merge, at the cost of rewriting the merge algorithm for attribution's sake. This doesn't touch the algorithm: for every prefix length it runs one \"press only these leading layers, apply once\" pass and compares the result against the previous one line by line, by index. An index that's newly appeared came from the layer just added; an index whose content changed records that layer into the line's \"who modified this.\" It holds only because a patch can only rewrite an existing line in place or append after it, so a top-level index identifies the same line across snapshots. Warnings for patches that hit nothing fall out of the same snapshots — each warning list extends the previous one, and the tail that just grew belongs to the layer just added.",
+   "why": "Attribution isn't part of the merge algorithm, so when it's wrong it can't contaminate the real launch path."
+  },
+  {
+   "name": "A rejection list for bootstrap-time variables",
+   "how": "The usual layered env loading just reads down the priority order and uses whatever it finds. This classifies first: one class of variable isn't config at all, it's part of how the process gets built — where executables are found, what arguments the runtime starts with, what gets preloaded during dynamic linking, the interpreters' startup hooks, the version-control tool's command hooks and config redirection, proxies, CA certificates, the TLS verification switch, the model service address. Plus four prefix groups: the product's own namespace, the desktop standard directories, macOS's dynamic linker, bash's function exports. Both files are parsed completely before either is applied, and a rejected name in either one throws for the whole thing. Accepted values don't override an inherited value of the same name.",
+   "why": "If a file that can be pulled into a project along with the code could set these, cloning a repository would amount to letting it change where your process loads code from and how it reaches the network. Parsing before applying guarantees that a rejection leaves no half-applied state."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Make the defaults the bottom diff layer, not a default file waiting for you to edit it.",
+   "why": "The user's file carries only the diff, so an upgrade that replaces the bottom layer produces no conflict at all; the only real tree is computed at runtime, so there aren't two states — \"what the file says\" and \"what actually runs\" — to reconcile. The other way around, an edited default file is a fork from that moment on, and every upgrade afterward costs you a three-way merge by hand."
+  },
+  {
+   "lesson": "A config preview must reuse the same code the real launch runs, never a second implementation.",
+   "why": "Two algorithms drift the moment one corner of their semantics differs, and drift shows up in exactly one place — the user edits their config to match the preview and the run comes out different, at which point nobody suspects the preview. Here even the config grammar the preview uses is taken from the mounting side, sealing off the fork at the source. The preview also refuses to carry app arguments: it doesn't start the tree, so it can't see what those flags would decide, and printing a tree that differs from the real one is worse than printing nothing."
+  },
+  {
+   "lesson": "Don't let the launcher know the app's flags; freeze the remaining stretch of arguments into a snapshot and publish it as a service.",
+   "why": "The app then owns its own flag family, help text, and errors, and adding an app doesn't touch the launcher. A config line that injects this service can also take its value lazily, letting the command line win over the default written next to it — the privilege is demoted into an ordinary service anyone can inject, rather than a private channel for a few lines."
+  },
+  {
+   "lesson": "Layered config has to first separate out the class of variable that only the launching environment may provide, and reject it wholesale before anything is applied.",
+   "why": "If the file layer could set the executable search path, the runtime's startup arguments, an interpreter's startup hook, or the TLS verification switch, you'd be letting a file that can be pulled into a project along with the code decide how the process starts, where it loads code from, and how it reaches the network. Parsing everything before applying anything also guarantees that a rejection never leaves one file half-applied."
+  },
+  {
+   "lesson": "Objects that enter the target tree by reference must be deep-copied every generation.",
+   "why": "Inserted lines are pushed into the mounted tree by reference, and later patches that hit by identifier modify those objects in place. Reuse one parse result and a single user override is written permanently into the in-memory default line — delete the override and you still can't get back. This class of problem is perfectly fine on the first reload and only shows itself on the second, which makes it exactly the kind that's hardest to cover with tests."
+  }
+ ],
+ "tradeoffs": [
+  "A patch that hits nothing just warns and skips. And where that warning goes: none of the three shipped layers mounts a console logging plugin, and the framework's built-in default exporter only writes records into a thousand-entry in-memory ring buffer. The result is that a typo'd identifier in your diff file is, in the running product, a completely silent no-op — only the config preview puts it on standard error.",
+  "A mismatched plugin name is also a warn-and-skip: the patch names one thing, the target line says another, the whole entry is discarded, and it falls into the same invisible channel. \"Skip if the target doesn't exist\" is reasonable for a shared override file — one override may serve several profiles at once — but for the layer a user writes by hand it's just silent failure. That collides head-on with the repository's own rule that misconfiguration must fail loudly.",
+  "A patch replaces an entire config block rather than merging into it, so any value that varies by mode can't live in the base layer, and every mode layer has to restate all of its line's keys in full. The duplication between the base layer and the mode layers can only be kept in sync by hand — with enough lines it drifts, and the drift doesn't raise an error.",
+  "That root config is overwritten on every launch, so anyone's direct edits to it are silently discarded, and the comment line at the top is the only warning. This is a knowing trade: what-you-see-is-what-you-get was sacrificed to keep composed lines from being baked onto disk.",
+  "Every launch runs the flat symlink repair: walk the entire dependency closure breadth-first, create a symlink per package. Dangling symlinks pointing at packages that are gone stay there until that package name gets claimed again. It's a fixed cost paid on every launch, and residue that never converges on its own.",
+  "Source attribution is a positional-diff heuristic that lives off one property: patches only rewrite in place or append after. An insertion inside a group can only be marked \"this layer changed this line,\" with no finer position visible within the group. Patches also only take effect on top-level entries: an entry sitting after a nested include can't be hit by identifier, and a comment in the example config spells out that one model therefore has to stay as written and can't be re-pinned by an outer override."
+ ],
+ "codeIndex": [
+  {
+   "path": "apps/cli/src/profile-boot.ts",
+   "note": "Composes the five-segment patch stack, rewrites the empty root, mounts the hot-reload backfill"
+  },
+  {
+   "path": "apps/cli/src/args.ts",
+   "note": "The launcher's flag border and argument validation for the config preview"
+  },
+  {
+   "path": "apps/cli/src/dump-config.ts",
+   "note": "Hands the layers to the renderer, reusing the same base as the launch"
+  },
+  {
+   "path": "packages/boot/app-boot/src/profile.ts",
+   "note": "Package-name resolution for profiles and layers, plus the flat symlink repair"
+  },
+  {
+   "path": "packages/boot/app-boot/src/index.ts",
+   "note": "The environment-variable rejection list, prefix snapshot diffing, and the line-activation audit"
+  },
+  {
+   "path": "packages/boot/cmdline/src/index.ts",
+   "note": "The frozen snapshot of inner arguments and the exit-request service"
+  },
+  {
+   "path": "vendor/include/src/index.ts",
+   "note": "The patch algorithm itself: identifier hits, insertions, skips, and warnings"
+  },
+  {
+   "path": "packages/bundle/base/cordis.patch.yml",
+   "note": "The base layer: one insertion laying out seventy-eight lines of core plugins"
+  }
+ ],
+ "related": [
+  "cordis-loader",
+  "cordis-core",
+  "preset",
+  "self-modification"
+ ]
+}

@@ -1,0 +1,221 @@
+{
+ "id": "skills-web",
+ "lede": "You write the agent twenty playbooks, expecting it to follow the right one when the matching task comes up. Then you run it and something awkward shows up: all twenty sit in the context in full, every single turn, and nineteen of them will never be touched. Delete a few to save money and the model acts as if they never existed.\n\nThe web side is the same flaw wearing a different face — ten results come back, the model actually reads one, and you have already paid for ten bodies of text.\n\nI'm increasingly convinced that the fix for this class of problem doesn't live at the layer of \"how do we get outside knowledge in.\" Getting it in is easy. The hard part is not being crushed by it once it's in.\n\n**What's worth watching here isn't how outside material gets in. It's whether \"knowing what exists\" and \"actually reading it\" can become two separately billed actions.**",
+ "packages": [
+  "packages/skill/skill",
+  "packages/skill/skill-filesystem",
+  "packages/skill/tool-skill",
+  "packages/skill/skill-badge",
+  "packages/web/web",
+  "packages/web/tool-web",
+  "packages/web/web-search-deepseek",
+  "packages/web/web-search-exa",
+  "packages/web/web-fetch-http",
+  "packages/attachment/attachment",
+  "packages/attachment/attachment-local",
+  "packages/todo/tool-todo"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "Twenty playbooks, nineteen you'll never open",
+   "body": [
+    "First, what a skill is: a way of doing something, written down ahead of time by a person, meant to be reused. A name and a one-line description on the front, the body behind it. How to open a PR that passes review, what voice this repo's docs should be written in — anything with a fixed routine can be written down once instead of re-explained every time.",
+    "The trouble is that once you have enough routines, the system prompt fills up with material you almost never need. Twenty playbooks sit there in full every turn, and nineteen of them won't be touched this turn.",
+    "The usual answer is a choice between two. Either cram it all in and eat the fixed cost you pay on every step, or add a semantic-retrieval layer and let some small model guess which one applies. You do save, but what you get back is a judgment you can't see and can't appeal.",
+    "The approach here splits a skill in half. Before each turn, the only thing injected is a catalog: names, plus a description squeezed under 500 characters, plus one line saying \"if one of these matches, pull it up before doing anything else.\"",
+    "The body is fetched only when the model asks for it on its own, then wrapped in a block tagged with the name and dropped into the conversation.",
+    "There's a knock-on effect that's easy to miss — the model's judgment call becomes a tool call that's visible, recordable, and refusable, instead of a black box buried in a retrieval layer.",
+    "The retrieved body comes with a note in front of it: where this skill's base location is, that relative paths mentioned in the body resolve against it, and that they're read only when needed.",
+    "So a skill can be an entire directory. The body is the index; scripts and reference material are the files it points at, and those files enter the context only at the moment the model decides to read them.",
+    "**In other words, the same layering — read the index first, then ask for the body — recurs once more inside a single skill.**"
+   ]
+  },
+  {
+   "heading": "A catalog needs an expiry date too",
+   "body": [
+    "The catalog isn't part of the system prompt. It's an ordinary message injected into the conversation. That brings two problems, neither of them obvious.",
+    "First, with dozens of skills installed, the catalog doesn't change on every step. Resending it every step is pure waste.",
+    "Second, context gets compacted. The old catalog message may already have been squeezed out of the window while the model still carries it in its head — it goes on believing a list that left long ago.",
+    "The usual answer is to nail the catalog into the system prompt and never move it. The price is that it becomes as immutable as the system prompt, and a skill installed at runtime can never get in.",
+    "The approach here is to compute a fingerprint for the catalog — over the durable ordered list of names and descriptions only, not the wrapper prose written for the model. If the last one is still in the visible window and the fingerprint matches, do nothing; if it changed, send a new one that says outright that this full catalog replaces every catalog before it.",
+    "There's one more safeguard: a source can volunteer that it didn't get everything this time. If any source reports itself incomplete, or throws and gets skipped, the result is neither cached nor published — better to let the model keep using the last catalog than to hand it a new one missing half its entries.",
+    "**Giving every injected block in the context an identity and a rule for when it goes stale is cheaper than resending it over and over, and less likely to lie to the model.**"
+   ]
+  },
+  {
+   "heading": "Two skills, one name — who wins",
+   "body": [
+    "Skills come from more than one place: the project, the user's home directory, whatever ships with the app, and whatever a plugin pushes in at runtime. Name collisions are a matter of when, not if.",
+    "The usual answer is one priority number line with every source seated along it. The problem surfaces the moment you want to say \"this agent has its own set of skills\" — you have to hand-reserve a gap on the line and pray nobody else takes it.",
+    "Here it's split into two levels. The first is the layer: globally registered plugins sit in one layer, plugins mounted by a particular agent preset sit in their own. Reads start at the global layer and stack inward along the caller's chain of layers, far to near, and an entry with the same name in a nearer layer displaces the far one whole.",
+    "Numbers only matter within a single layer: the project's two directories are 100 and 200, runtime-pushed is 250, custom directories 300, the home directory's two are 400 and 500, app-bundled is 600, lower wins; ties go to whoever registered first.",
+    "The displaced one leaves a log line spelling out which entry from which source got pushed out by whom. That information reaches operators only — in the catalog the model sees, it simply doesn't exist.",
+    "The local side's job is turning disk into skills: walk up from the current directory to the repository root and call that the project root, then scan, in order, the project's two skill directories, any extra directories named in config, the two under the home directory, and finally the one shipped with the app. A missing directory isn't an error; it returns empty.",
+    "Two shapes are accepted in each directory: a subdirectory holding a file under an agreed-upon name, or just a Markdown file. The header must carry a valid lowercase hyphenated name and a non-empty description; otherwise it's skipped with a log line saying why, rather than failing the whole discovery pass. Written in the old camel-case spelling, it errors outright instead of being treated as absent.",
+    "Reads go through the filesystem capability by default, which means skill content is bound by the same path policy as any other file read. The one exception is the app-bundled root — it lives in the install directory, outside the workspace policy's remit to begin with, so it's marked a trusted host path and read directly.",
+    "How do you know a directory changed? Two paths: a file watcher on those roots, degrading to polling the parent path when a root doesn't exist yet and waiting for it to appear; and the observation event that arrives when the agent itself changes a file with a write or edit tool — check whether that path looks like a skill, and if it does, drop the cache.",
+    "**Which entry shadows which should be expressed by structure, not by people dodging each other along a single number line.**"
+   ]
+  },
+  {
+   "heading": "Who gets to push instructions into the conversation",
+   "body": [
+    "Skills have a second entrance: the user types a slash and a name straight into their own message. No model judgment involved — the system renders the body before the step begins and appends it as an extra instruction after every other injection, the position closest to the model's answer.",
+    "That move carries more weight than it looks like it does. Injecting a whole body of instructions into the conversation amounts to temporarily granting some piece of text elevated privileges.",
+    "So recognizing it is tightened in two ways.",
+    "One is shape: whitespace on both sides, and no second slash allowed, so paths and fractions never match by accident.",
+    "The other is origin: only text blocks in messages marked as typed directly by the user are scanned. Tool output, injected context, messages written in by other plugins — even with the exact same characters, none of them fire.",
+    "If a matched name can't be found, or is marked as not user-invocable, it's let through as ordinary text. A skill can declare two switches of its own — no model invocation, no user invocation. The first kind never appears in the catalog at all and is refused when loading tries to fetch it; it can only be called up by a person.",
+    "**A gesture that changes what the model sees has to be bound to a channel whose origin you trust; otherwise outside text can forge it.**"
+   ]
+  },
+  {
+   "heading": "Two search backends installed — which one runs",
+   "body": [
+    "Search and fetch share one capability seam. The seam itself never touches the network; all it holds is two rosters of backends.",
+    "The usual answer is to decide who runs at registration time, or just take the first one registered. Both turn line order in the composition file — a purely accidental fact — into the thing that decides behavior. Reindent a line and you might swap out the search backend.",
+    "Here the choice is deferred to the moment of each call, and four kinds of failure are split into four distinct error codes:",
+    "- A name is configured, but no such backend is on the roster",
+    "- It's on the roster, but says it isn't usable right now",
+    "- No name configured, and nothing usable exists",
+    "- No name configured, and several usable ones exist — report the ambiguity instead of picking for you",
+    "That \"are you usable right now\" question is defined as a cheap local check: is the key empty, is the address well-formed. No network requests allowed.",
+    "The fetch side does a safe retrieval: http and https only, no credentials in the address; redirects are followed only within the same origin, cross-origin ones refused outright so the model has to make a fresh call against the new address — which means every change of source goes back through tool permission. A non-2xx response isn't thrown as an exception either; it's a result, and the status code is that resource's state. Conversely, a declared character set that can't be recognized errors immediately rather than handing you a screenful of garbage.",
+    "What the model actually sees is decided one layer up, in the tool: fetched pages are converted to Markdown, script and style blocks are dropped whole, the output has a character ceiling, and a truncated one gets a line appended telling the model to come back with a more specific address. Search results render as a linked list, while a faithful array of sources is kept alongside in structured metadata — so replaying the session can rebuild the cards without reverse-parsing the text written for the model.",
+    "**Moving \"which backend\" from assembly time to execution time costs one extra resolution per call; what you get back is behavior that no longer depends on formatting.**"
+   ]
+  },
+  {
+   "heading": "Keys don't belong in config files",
+   "body": [
+    "A search backend needs a key. And config files get read, displayed, and committed to version control.",
+    "The usual answer is a field in the config and a line in the docs saying \"careful, don't commit this.\" That warning usually stays in force until the next new hire's first day.",
+    "What's stored in the config here isn't the value but a reference — the name of an environment variable, explicitly marked with the role \"this is a credential reference,\" with the value held by the credential capability's own provider.",
+    "Resolution happens on every operation, not at plugin startup. Swap the key and the next search picks it up; no remounting the plugin. A settings UI can ask whether the reference is set, which layer it came from, and whether it's writable, without ever getting the value itself.",
+    "The credential side has one more global rule: empty equals absent. An empty string never poses as a configured key.",
+    "The config itself can change at runtime too. What a backend registers isn't a snapshot of the config but a closure that re-projects the current config on every search — commit a new value and the next search uses it, with the registered object untouched.",
+    "A harder constraint shows up here too: any input the model can see has to be reconstructable from the session log. One kind of search delegates the whole retrieval to an upstream model, so the provider appends the key-free request body as a session event before the request goes out. If that record fails to write, the request is never sent.",
+    "**Order isn't a detail. Record-then-send versus send-then-record is the difference between being able to explain what the model saw after a crash and not.**"
+   ]
+  },
+  {
+   "heading": "Images can't go in the log, lists don't do increments",
+   "body": [
+    "A session log can store text. It can't store an image.",
+    "The usual answer is to encode the image into one long string of text and stuff it straight into the message. At a few hundred KB an image, the log immediately becomes a monster you can't read, can't diff, and have to decode all over again on every replay.",
+    "What's offered instead is an immutable object store: put an image in, get a reference back — an id made of the content hash, a media type verified against the bytes, an exact byte count, width and height, and a display name with the path information stripped off. The reference is what the log stores.",
+    "The write order was derived backwards from one requirement: before a session checkpoint can mention a reference, the object must already be on disk. Decode and verify in full, write a temp file and force it to disk, hard-link it to a target named by the hash, flush the containing directory and each parent above it in turn, then delete the temp file. If the target already exists, that means identical content — read it back, confirm the hash matches, and count it as a successful dedupe.",
+    "Reading back does exactly two things: hash the whole span of bytes and compare, then parse only the header to re-derive format, width and height, and check each against what the reference recorded.",
+    "Why not decode in full again? Because the hash already proves these are the same bytes that were fully decoded and verified the first time. Replaying history doesn't have to pay the decode cost over and over, and it closes off the route where one malicious image gets its attack multiplied by the number of replays.",
+    "The to-do list is the same idea from the other side. That tool takes exactly one parameter: the complete task list. Its description repeats in capitals that you send the whole thing every time, that it replaces the previous one, that there are no incremental updates and no single-item edits.",
+    "This isn't laziness. Incremental editing assumes the model remembers the previous list's contents and index numbers exactly — get it wrong once and you have a silent drift that raises no error. Whole-list replacement makes every call carry the complete state, replay collapses to last-write-wins, and the UI only needs to read the last event.",
+    "Validation covers three more things: content can't be blank, no duplicates within one list, and at most one task in progress. Whether to relax that last one is a deployment decision, and the switch is a required boolean rather than an option with a default — a product running subagents concurrently and a product working serially want opposite discipline, and the tool description itself changes wording accordingly.",
+    "The parameter definition also turns off extra properties: one field too many from the model fails validation outright instead of being quietly smoothed away. The version recorded in the log has to equal the version the model thinks it wrote.",
+    "**Both of these say the same thing: anything that feeds into the next round of decisions needs an identity that is durable, replayable, and can't be quietly rewritten along the way.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Resend the catalog only when its content changed",
+   "how": "The usual answer is to resend the catalog every step, or nail it into the system prompt and never move it. Here a fingerprint is computed over the ordered list of names and descriptions — only the durable entries, not the wrapper prose written for the model. If the last one is still in the visible window and the fingerprint matches, do nothing; if it changed, send a new message that says outright it replaces every catalog before it. The fingerprint is computed by serializing each entry first and then joining, because any separator you might pick is a legal character inside some description.",
+   "why": "A one-word edit to the wrapper prose shouldn't trigger a resend; and once compaction squeezes the old catalog out of the window, the model shouldn't go on believing a list that no longer exists."
+  },
+  {
+   "name": "The nearer layer displaces the farther one",
+   "how": "The usual answer is one priority number line shared by all sources; to give one agent its own set of skills you hand-reserve a gap on the line and pray nobody takes it. Here it's two levels: which layer you register into is decided by the caller's scope, and reads start global and override layer by layer from far to near, with a same-named entry in the nearer layer displacing the far one whole. Numbers order things only within a layer, and ties go by registration order. The displaced entry leaves an operator log line and nothing on the model side.",
+   "why": "It makes \"this agent has its own set of skills\" something the structure can state directly, instead of something numbers have to dodge around."
+  },
+  {
+   "name": "Didn't get everything? Keep the last one",
+   "how": "The usual answer is to publish whatever was collected and treat a timed-out remote source as having had nothing this time. Here a source can explicitly report that it didn't get everything. If any source reports itself incomplete, throws and gets skipped, or the registry's revision number changes mid-collection, the result is neither cached nor published, and the model keeps using the previous catalog. The cache key itself carries the working directory and the layer-chain identity, and any registration or deregistration bumps the revision and clears the cache.",
+   "why": "One remote hiccup shouldn't hand the model a new catalog missing half its entries and let it conclude those skills are gone."
+  },
+  {
+   "name": "Which backend gets decided at call time",
+   "how": "The usual answer is to bind the backend at assembly time, or take the first one registered — so line order in the composition file decides behavior. Here it's deferred to each call: with a name configured, look it up on the roster and ask whether it's usable right now, where \"no such backend\" and \"present but unusable\" are two different error codes; with no name, filter down to the usable ones and run only if there's exactly one, with zero and several each raising their own error, never picking on the user's behalf. That availability question is defined as a cheap local check, with no network requests allowed.",
+   "why": "Registration order is an accident of the composition file; letting it decide which search backend runs is letting formatting decide behavior."
+  },
+  {
+   "name": "The object lands before the reference appears",
+   "how": "The usual answer is to return the reference as soon as the file is written and leave the rest to the operating system. Here the order was derived backwards: create the temp file exclusively, write, flush, close, hard-link to a target named by the hash, flush the containing directory and each parent above it in turn, then delete the temp file. Each process also independently flushes every directory level from the storage root up to the filesystem root and keeps its own in-process tally — a directory another process created only proves it exists, not that its directory entry reached disk.",
+   "why": "Once a session checkpoint references an attachment, that attachment has to be readable after a crash; \"exists\" is not \"durable.\""
+  },
+  {
+   "name": "Whole-list replacement, no incremental edits",
+   "how": "The usual answer is to give the list create/read/update/delete and let the model change one item at a time. Here there's a single parameter — the complete list — and the tool description repeats in capitals that it replaces the previous one and that there are no incremental updates. Each call appends the whole list as one session event, the projection folds down to the most recent one, and it resets at the start of the next turn rather than at the end of the current one. The parameter definition also turns off extra properties: one field too many from the model fails validation outright instead of being quietly smoothed away.",
+   "why": "Incremental editing requires the model to remember the previous list's contents and index numbers exactly, and one mistake is silent drift; not clearing at the end of the turn is what keeps the finished list on screen."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Split \"knowing what exists\" and \"reading its body\" into two context actions you pay for separately.",
+   "why": "Index entries are short and bounded in number; bodies are long and mostly never needed. Have the model read the index first and ask for a body explicitly, and the context only pays for the one that actually matched. The bonus is that the judgment call itself becomes a tool call that's visible, recordable, and refusable, instead of a black box buried in a retrieval layer."
+  },
+  {
+   "lesson": "Choose the capability backend at the moment of the call; don't let registration order decide for you.",
+   "why": "Registration order is an accidental sequence in the composition file; reindent a line and you might swap out the search backend. Resolving at execution time also lets you separate \"the name is wrong\" from \"the name is right but it isn't usable\" into two different errors, and report ambiguity out loud instead of quietly picking one for the user and leaving them to guess later why the results look off."
+  },
+  {
+   "lesson": "Store the reference to a credential in the config file, not the credential's value.",
+   "why": "Config gets read, displayed, and committed, and once a value is in there it's hard to take back — while the \"careful, don't commit this\" warning usually stays in force until the next new hire's first day. With a reference stored instead, a UI can describe the source and whether it's writable without ever seeing the plaintext; swap the key and the next operation picks it up, with no separate remounting flow needed for it."
+  },
+  {
+   "lesson": "Express a stateful list as whole-list replacement, not incremental edits.",
+   "why": "Incremental editing assumes the model remembers the previous list's contents and index numbers exactly; one mistake is a drift that raises no error and keeps accumulating until someone spots it by eye. Whole-list replacement makes every call carry the complete state, replay collapses to last-write-wins, and the UI only needs to read the last event."
+  },
+  {
+   "lesson": "A gesture that injects content into the model accepts exactly one channel: the one whose origin you trust.",
+   "why": "Injecting a whole body of instructions into the conversation amounts to temporarily granting some piece of text elevated privileges. Only messages marked as typed directly by the user are scanned, so tool output and content written in by other plugins don't fire even when the characters match exactly — which leaves outside text no way to forge the move."
+  }
+ ],
+ "tradeoffs": [
+  "The skill catalog still goes into the context in full. Each description is squeezed under 500 characters, but the number of entries isn't capped — install a few dozen and the catalog alone is a fixed cost you pay on every step, and when it changes what gets resent is the whole catalog, not a delta.",
+  "A shadowed name collision leaves only a log line. The model side sees nothing about another entry with the same name being displaced, and unless the user goes digging through logs, it's hard to explain why editing the project's copy of a skill had no effect at all.",
+  "An unknown name in the slash gesture silently degrades into ordinary text. One mistyped character produces no warning at all; the user just watches the model take that line literally — this is a bill paid for safety, but it lands on the user.",
+  "The local fetch backend has no protection against the agent being talked into requesting internal-network addresses; that's stated in the module comment along with a warning not to enable it in environments that can reach sensitive internal targets. The same-origin redirect restriction blocks cross-origin hops only, not a first request that points at the internal network to begin with.",
+  "Attachments accept four raster formats and depend on a native decoding library; the write path does multiple flushes and directory syncs for durability, so writing one image is noticeably slower than an ordinary file write.",
+  "Once loaded, a skill's body enters the context whole — no chunking, no summarizing, no on-demand truncation. Keeping the size down falls to whoever writes the skill: split large content into separate files under the base directory and point at them with relative paths from the body."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/skill/skill/src/index.ts",
+   "note": "Layered skill registry: merging sources, resolving name collisions, catalog caching and invalidation; within-layer rank and runtime registration"
+  },
+  {
+   "path": "packages/skill/tool-skill/src/index.ts",
+   "note": "Skill loading tool, fingerprint-based deduplication and replace semantics for the catalog message, the slash gesture's injection path and the 500-character description cap"
+  },
+  {
+   "path": "packages/skill/skill-filesystem/src/index.ts",
+   "note": "Local root scan order and rank constants, frontmatter parsing and skipping, file watching and the cache-invalidation paths"
+  },
+  {
+   "path": "packages/web/web/src/index.ts",
+   "note": "The web capability seam: two provider registries and the four error codes of execution-time selection"
+  },
+  {
+   "path": "packages/web/web-search-deepseek/src/index.ts",
+   "note": "Credential reference, settings section, re-projecting config on every search, writing the session event before sending the request"
+  },
+  {
+   "path": "packages/web/tool-web/src/fetch.ts",
+   "note": "HTML to Markdown, output ceiling and truncation hint, the structured source array behind search results"
+  },
+  {
+   "path": "packages/attachment/attachment-local/src/store.ts",
+   "note": "Content-addressed writes to disk, directory fsync order and the in-process tally, hash-plus-header double verification on read-back"
+  },
+  {
+   "path": "packages/todo/tool-todo/src/index.ts",
+   "note": "Whole-list-replacement todo tool, the required concurrency switch, the session projection that resets at the start of a turn"
+  }
+ ],
+ "related": [
+  "tools",
+  "system-prompt",
+  "session",
+  "agent-loop"
+ ]
+}

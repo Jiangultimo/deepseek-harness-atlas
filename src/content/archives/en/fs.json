@@ -1,0 +1,217 @@
+{
+ "id": "fs",
+ "lede": "When you let a model edit a user's files, the first worry is that it writes the wrong content. But the accident that actually makes your blood run cold is a different one: it overwrites a file it never read, top to bottom.\n\nThis is far too easy to hit in the real world. All the model has is a path string. It doesn't know how big the file is right now, whether it's binary, or whether some segment in the middle of that path is a symlink pointing somewhere else. It just says: write this content here.\n\nMost systems answer this by adding a line to the prompt: read before you write. That works, of course — until the one time it doesn't.\n\n**A safety rule whose enforcement still depends on the model's good behavior isn't a rule. It's luck.**",
+ "packages": [
+  "packages/fs/fs",
+  "packages/fs/fs-local",
+  "packages/fs/fs-sandbox",
+  "packages/fs/fs-observation-policy",
+  "packages/fs/tool-fs"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "Where the cut lands matters more than how many layers",
+   "body": [
+    "Almost every project wraps the filesystem in a layer of its own. What that layer ends up looking like varies enormously.",
+    "The usual cut is made along convenience: the abstraction hands you a pile of handy methods, and reading a file throws in line numbers, windowing, and truncation while it's at it; as for whether this particular write should be blocked, the caller can work that out for itself.",
+    "What's worth watching here isn't how many layers you end up with. It's where the cut lands.",
+    "This abstraction fixes only two things: which operations exist, and who is responsible for each one.",
+    "Everything that lands on the backend side is something only the backend can answer: a file's stable identity, the absolute path this process can actually open it by, whether it sits inside a given directory, how text gets decoded, how binary gets rejected, how a change is made atomic.",
+    "Two things are explicitly not the backend's business: how many lines a single read returns, and whether a given write should be blocked. The first is presentation, the second is policy. Both change with the situation, and the backend has no business knowing either.",
+    "There's one exception running the other way. The edit operation — swap one span of text for another — could perfectly well be split into read, match, write and pushed up to the tool layer. It would look cleaner. But then version checking, matching, and writing back are scattered across three independent calls, and anyone can slip in between them.",
+    "It stays in the backend not because the backend is convenient, but because only the backend can put all three inside the same critical section.",
+    "Two more operations look redundant at first glance. One reads metadata without following a symlink in the path's last segment, so a caller can reject symlinks in the repo before anything gets resolved. The other reads raw bytes and requires a byte ceiling — leave it out and the code won't compile.",
+    "The second one is worth dwelling on. \"Never read an arbitrarily large file into memory\" can live in the docs, or it can be nailed into the parameter list. In the docs it's a suggestion. In the parameter list it's a question you have to answer.",
+    "The error codes belong to the abstraction too — thirteen of them: not found, not a directory, not a regular file, not text, over the limit, permission denied, sandbox denied, stale version, never observed, edit matched in several places, edit matched nothing, read/write failure, cancelled. The backend and the policy layer throw the same set.",
+    "**That single decision is what lets the layers above get smart: retries, escalation, and UI branching can all key off a code instead of parsing an English sentence out of an error message.**"
+   ]
+  },
+  {
+   "heading": "A path can't identify a file",
+   "body": [
+    "The same file can be written countless ways: through a symlink, with parent-directory hops, in different letter case, or as one of those old-style short names on Windows. They point at the same data; the strings all differ.",
+    "Use the path as the identity and the trouble starts immediately: writing through a symlink and writing through the real path count as two different files, so they queue separately, so the record of what was read before a write no longer lines up.",
+    "The usual move is to normalize the path — strip the parent hops, unify the separators, fold the case — and use that as the identity. It catches some of this. It doesn't catch symlinks.",
+    "Here, every operation first resolves an identity object holding two things: an identity string for machines, and a display path for humans.",
+    "The identity string is deliberately opaque. The docs say it outright: don't parse it, and don't assume it's a local absolute path — a remote backend might put a workspace handle in there, or a file number. If you actually need a path a child process can open, there's a separate method for that.",
+    "The compiler is pulled in to help: the identity string is a marked string type, and an ordinary string won't assign into it.",
+    "The local backend puts the real path in there, with every symlink resolved. Symlink and real path land on the same identity, sharing one queue and one staleness verdict.",
+    "But there's a catch: when the file doesn't exist yet, there are no symlinks to resolve.",
+    "The handling is to walk upward — find the nearest ancestor that does exist, resolve that, then glue the missing segments (the filename, plus any intermediate directories not created yet) back on in order.",
+    "So before creation and after creation compute to the same identity. The observation recorded before the write is the one that still matches after it.",
+    "The version token takes the same route: also opaque, with the local implementation stitching together device number, inode number, size, and two nanosecond-precision timestamps. Writes and edits both take it as a precondition; the caller's only job is to hand it back untouched, never to interpret it.",
+    "**Once an identity that crosses a boundary gets sliced and concatenated downstream like an ordinary string, you can never swap the backend again — every call site will quietly go wrong somewhere you aren't looking.**"
+   ]
+  },
+  {
+   "heading": "How read-before-write stops depending on good intentions",
+   "body": [
+    "Back to the accident at the top: how do you make \"don't overwrite a file you haven't read\" into a real rule?",
+    "The obvious move is a check inside the tool — before writing, look up whether this session has read the file, and error out if it hasn't.",
+    "Two problems. There's a gap between finishing the check and actually putting pen to paper, and the file may have been swapped out in between. And the rule is welded into the tool, so wanting a different one — looser, per-project, or none at all — means changing the tool itself.",
+    "Here it's split into two things.",
+    "The first is producing an intent. The abstraction declares two events: one asks how this overwrite means to write, the other asks whether this edit is allowed. Who answers is open, and what comes back is a value, not a pass or a reject.",
+    "The second is that the verdict isn't reached here at all. The intent is carried all the way down to the backend and checked inside the lock — the next section takes that up.",
+    "The answering is done by a policy plugin that's mounted by default. What's interesting about it: it registers no service at all, hangs three listeners, and keeps all of its state in one table of its own.",
+    "The table has two levels: the outer keyed by a weakly held owner (normally the current session), the inner by file identity. The value recorded is one of three — seen and present (with its version), confirmed absent, or never seen at all.",
+    "Confirmed absent and never seen have to stay apart, or creation and editing can't produce different errors.",
+    "The rules come out startlingly short: never seen or confirmed absent gets create-if-absent; seen and present gets replace-at-this-version. Editing is stricter — never seen is refused outright, and confirmed absent reports not found.",
+    "What the underlying plugin framework actually offers is a relay chain of listeners: each one either calls it, or passes the decision to the next. But both the comments and the implementation treat it as a single slot — the first to produce an intent owns the decision, with no relay and no combining with anyone else.",
+    "**A guard is mutually exclusive by nature; stacking two policies means nothing. The chain is kept not for combining, but so replacing and ordering stay possible.**"
+   ]
+  },
+  {
+   "heading": "The gatekeeper isn't the policy. It's the lock.",
+   "body": [
+    "An intent is only how a write means to go. Whether it holds has to be settled by whoever actually holds the file.",
+    "The usual approach is to check the current version before writing and write if it matches. There's a gap in the middle, and that's exactly where someone else slips in.",
+    "Here the backend keeps one queue per file identity, and every operation that can change the file runs serially on it. The order inside the lock is fixed: take the current state once, check the intent against it, write, then take it once more to get the new version.",
+    "The point is that the whole stretch is inside the lock. Read, judge, and write can't interleave, so two concurrent writes become a deterministic order — one wins, the rest see the new version and come back stale. Not mutual clobbering, and not whoever-is-fastest-wins.",
+    "The checking rules are short enough to memorize. Create-if-absent hitting a file that already exists reports never observed — you didn't read it, so don't overwrite it. Replace-at-version meeting a vanished file or a version that doesn't match reports stale.",
+    "The write itself is atomic too. It doesn't write onto the target file. It creates a temporary directory in the same directory that only the owner can enter, creates a temporary file inside it exclusively, writes the content and flushes it to disk, restores the original file's permission bits if needed, and as the last step renames over the target.",
+    "The same directory isn't an offhand choice: a rename is only atomic within one filesystem. The private temporary directory isn't offhand either: the temporary file must be neither visible to anyone else nor replaceable by them.",
+    "And the create-if-absent path doesn't go through rename. It goes through a hard link.",
+    "The reason is plain: rename overwrites, a hard link never does, and it is bound to fail when the target already exists. Rather than write your own check-whether-it's-there-then-decide dance — another gap — just switch to an operation that cannot overwrite in the first place.",
+    "An edit does its read, match, and write-back inside the same lock. The version is checked before the match: an edit based on old content has to report stale, not go match against the new content and then report not found or matched in several places. Those two errors mean completely different things to a model — one says your information is out of date, read it again; the other says your replacement string is wrong. Give the wrong one and the model fixes in the wrong direction.",
+    "Line-ending style gets unified here too: on the way in it's folded to one baseline with the original remembered, matching and diffing both happen on the baseline, and it's restored on the way back out. The before and after text returned upward is the folded version — line-ending style is a storage detail, and it shouldn't make a diff look like every line changed.",
+    "**Read once, judge once, write once: unless those three sit in the same critical section, any guard you write is just there to make you feel better.**"
+   ]
+  },
+  {
+   "heading": "The thing you checked has to be the thing you write",
+   "body": [
+    "The sandbox backend is a thin thing: it inherits the local backend directly, overrides only write and edit, and passes every read straight through (reads are allowed in every mode). All it adds is one per-call fence.",
+    "The fence has three branches: wide open lets everything through; read-only refuses outright; workspace-writable requires the target to fall inside the set of writable roots. Those roots come from the same entry point in the sandbox package that the command-line side uses, so the two can't drift apart.",
+    "The real design is in the return value.",
+    "The usual approach has the check return a yes or a no. The caller gets a yes and goes on writing with the target it already had in hand.",
+    "Not here. The check doesn't return a boolean. It resolves the path again, gets the identity as of now, judges whether that identity is legal, and hands the new identity straight to the parent to write.",
+    "The difference: there is time between the tool layer resolving a path and the write actually landing. If some ancestor directory gets swapped for a symlink pointing elsewhere during that time, re-resolving sees it and a caller holding the old identity does not.",
+    "More fundamentally, what gets checked and what gets used are now the same object. Check one thing, write another — that class of defect doesn't exist by construction.",
+    "The containment test itself comes in two stages. First a string comparison (case-insensitive on Windows); a hit returns immediately. Only a miss falls back to filesystem identity: take metadata on the root once, then walk the target's existing ancestors level by level, comparing device and inode numbers.",
+    "This is for short names and case aliases on Windows — spelled differently, the same directory underneath. Skip the step and you wrongly call it out of bounds; loosen the test into fuzzy text prefix matching and you've weakened containment itself.",
+    "The comments are blunt about the threat model, and I think that bluntness is worth more than anything else here: this is trusted code running a policy check on paths a model supplied, not a kernel boundary. The system calls are issued by this layer itself and only the path is untrusted, so normalize-then-test-containment is a complete answer on that front. Isolating untrusted code is the command-line sandbox's job. The residual timing race is only narrowed, and is explicitly accepted.",
+    "**A security boundary that can say plainly what it does and doesn't defend against is far more trustworthy than one that vaguely claims to be secure.**"
+   ]
+  },
+  {
+   "heading": "The model only sees the outermost layer",
+   "body": [
+    "None of the above is visible to the model. What it sees is three tools: read, write, edit.",
+    "The read tool takes metadata exactly once and uses that single reading three ways: to determine the type, to decide by size between reading the whole thing and streaming it, and as the version it records.",
+    "It also declares itself safe to run concurrently. The reason isn't that reads have no side effects — it's that a racing observation fails closed: the real guard re-checks the version inside the lock, so the worst a concurrent observation can do is make some write come back stale.",
+    "The window is computed while scanning: split by line, truncate an over-long line and mark it with a suffix, stop and flag truncation once the selected output's accumulated bytes pass the ceiling — but keep scanning to the end of the file, so the total line count comes out exact. The single-line buffer has a hard cap (the maximum line length plus one character, enough to prove it overflowed), so a file that is one several-hundred-megabyte line won't blow up memory. A requested start line past the total reports not found rather than silently returning nothing.",
+    "Relative paths resolve against the working directory recorded by the calling session, not the directory the service process started in; with a sandbox policy in place, the workspace root from that policy is used instead. A direct call that didn't come from an agent returns nothing and hands the fallback back to the backend.",
+    "This matters more than it looks: the default is produced in a step you can read, not scattered through the execution path as null-coalescing. What this resolves against, exactly — there is always one definite answer.",
+    "The sandbox escalation fields show up conditionally. Only when the mounted backend reports that it constrains paths do request-wider-permission and reason appear in the parameter lists for write and edit; otherwise they aren't in the parameter list at all, and validation rejects them.",
+    "In other words, in a deployment that will never meet a sandbox, the model has no idea escalation exists and so never tries for it. Escalation goes through approval, and can only be a strictly wider one-shot retry.",
+    "Errors get worked over twice before they reach the model. A sandbox refusal is swapped for the same marker text the command-line tool uses plus an escalation hint, while the original structured code is kept. Stale and never-observed get the one correct remedy appended after the original message — re-read then retry, read first then retry.",
+    "The message on the backend side stays machine-facing, not a word changed. The rework happens only in the outermost layer.",
+    "Write and edit also compute the change into diff hunks with three lines of context and stash them in the result metadata to be persisted. The confirmation text the model sees carries none of this structured data, and on replay there's no way to work it back out of the text — don't store it and the UI can't rebuild the diff card.",
+    "**One failure has to tell the model what to do next, leave the system a record of which kind of failure it was, and leave the UI a record of what actually changed. Cram all three into one sentence and you do none of them well.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Fixing a file's identity before the file exists",
+   "how": "The usual approach normalizes the path and calls that the identity. The problem is that when the file doesn't exist, the symlinks in the path can't be resolved at all, so before creation and after creation don't compute to the same identity. Here it walks upward: find the nearest ancestor that really exists, resolve every symlink on it, then glue the missing filename and any not-yet-created intermediate directories back on in order. The same loop quietly patches over a platform difference — with a regular file wedged in the middle of a path, one family of systems reports not a directory while Windows reports doesn't exist.",
+   "why": "Without this step, the two identities on the confirm-absent-then-create path don't match, and the no-overwrite guard might as well not be there."
+  },
+  {
+   "name": "A lock that queues per file",
+   "how": "The usual approach checks the current version before writing and writes if it matches — there's a gap in the middle, and that's exactly where someone else slips in. Here the backend keeps one queue per file identity and runs every change serially, with a fixed order inside the lock: take the current state, check the intent against it, write, take it once more for the new version — the whole stretch uninterleavable. A failure of one operation on the queue is swallowed so it doesn't drag down the waiters behind it; when an operation finishes and it's still last in line, its entry is removed, keeping the table from growing without bound as files accumulate.",
+   "why": "Concurrent writes stop being whoever-is-fastest-wins and become one succeeds, the rest are told plainly that their content is out of date."
+  },
+  {
+   "name": "Write beside it, then swap in one step",
+   "how": "The usual approach writes straight onto the target file; crash halfway through and the file is half a file. Here it creates a temporary directory that only the owner can enter, in the same directory as the target, creates a temporary file inside it exclusively, writes the content and flushes it to disk, restores the original file's permission bits if needed, and renames over the target at the end. The same directory isn't an offhand choice — a rename is only atomic within one filesystem; the private directory isn't offhand either — the temporary file must be neither visible to anyone else nor replaceable by them.",
+   "why": "Anyone reading the file sees either the complete old content or the complete new content. There is no in-between state."
+  },
+  {
+   "name": "If overwriting is forbidden, use an operation that can't overwrite",
+   "how": "On the create-if-absent path, the usual approach checks whether the file is there and writes if it isn't — another gap between the check and the write. Here rename is dropped for a hard link: a hard link never overwrites, and it is bound to fail when the target already exists. After a failure it doesn't look at the error code either, because the codes reported across platforms and filesystems simply don't line up; it takes the target's metadata once more and classifies by what it sees — present and a regular file reports never observed, present but not a regular file reports not a regular file, and nothing there at all falls through to read/write failure.",
+   "why": "It turns no-overwrite from a check you have to implement correctly into a primitive you can't implement wrong."
+  },
+  {
+   "name": "Only one voice is allowed on this decision chain",
+   "how": "The usual approach hardcodes whether a given write should be blocked into the tool. Here the judgment becomes an event: anyone can answer, and what comes back is an intent value rather than a pass or a reject. The underlying framework offers a relay chain of listeners, but it's used as a single slot — the first to produce an intent owns the decision. The default policy plugin takes that slot exactly this way: it registers no service, hangs three listeners, and keeps all its state in one two-level table of its own, the outer level keyed by weakly held session, the inner by file identity.",
+   "why": "A guard is mutually exclusive by nature, so stacking two policies means nothing; the chain is kept only so replacing and ordering stay possible."
+  },
+  {
+   "name": "The check doesn't return yes or no. It returns the thing.",
+   "how": "The usual approach has the permission check return a boolean; the caller sees a pass and goes on writing with the path it already had. Here the check returns no boolean: it resolves the path again, gets the canonical identity as of now, judges whether that identity falls inside a writable root, and hands the new identity straight to whoever actually performs the write. There is time between the tool layer resolving a path and the write landing; if an ancestor gets swapped for a symlink pointing elsewhere during it, re-resolving sees that. More fundamentally, what gets checked and what gets used are from then on the same object.",
+   "why": "Check one thing, write another — that class of defect no longer needs code review to catch it, because the design leaves no way to write it."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Separate deciding from enforcing: policy only computes an intent, and enforcement goes to whoever actually holds the lock.",
+   "why": "The policy layer can't guarantee the file didn't change between finishing its computation and the write landing. Have it produce only an intent value, and let the lock holder check it and commit inside the same critical section — that's what makes the guard atomic. A side benefit: policy becomes a detachable part. It holds no enforcement power, so removing it breaks no invariant."
+  },
+  {
+   "lesson": "A check should return the object it checked, not a yes or a no.",
+   "why": "A caller handed a boolean carries on with the stale identity it already had, and a symlink swapped in the meantime becomes a hole — one that looks perfectly normal in the source. Returning the re-resolved identity and forcing everything downstream to use it demotes that class of defect from something review has to catch to something you can't write in the first place."
+  },
+  {
+   "lesson": "An identity that crosses a boundary should be opaque, and the docs should say outright that parsing it is forbidden.",
+   "why": "The moment consumers start slicing, concatenating, and comparing it like a local path, the day you swap in a remote or sandboxed backend every call site goes quietly wrong where nobody is watching. A compile-time marker blocks the accidental assignment, and a separate method supplies the path that is actually usable — which keeps the cost of replacing a backend shut inside the backend."
+  },
+  {
+   "lesson": "A read done for looks must never turn a write that already succeeded into a failure.",
+   "why": "An overwrite makes a best effort to pre-read the old content so it can show a context diff, but that content serves presentation and nothing else. So past the default ten-megabyte ceiling, or binary, or invalidly encoded, or deleted concurrently — all of them just return nothing and let the layer above fall back to a whole-file diff. Anything that serves display alone should have the property that its failure doesn't touch the main line."
+  },
+  {
+   "lesson": "A default should be produced in a step you can read.",
+   "why": "What a relative path resolves against is decided explicitly: with a session, its working directory; with a sandbox policy, the workspace root from that policy; with neither, return nothing and hand the fallback back to the backend. That way the question of what this resolved against always has an answer you can read, instead of several defaults overriding each other with nobody able to say afterwards which one took effect."
+  }
+ ],
+ "tradeoffs": [
+  "The sandbox fence is trusted code running a policy check on paths a model supplied, not a kernel boundary. The race where an ancestor symlink is swapped between re-resolution and the actual system call is only narrowed, and the comments say plainly that this is accepted residual risk. Isolating untrusted code takes the kernel-level sandbox on the command-line side.",
+  "The policy plugin is detachable, and removing it doesn't make the tools error — they quietly degrade into unconditional atomic overwrites, and the read-before-write protection goes with it. The docs call this clean degradation. The price is that whoever composes the configuration has to remember to mount it, or the difference in safety shows up only in runtime behavior, invisible to static checks.",
+  "Observation state lives per session in an in-memory table of weak references. Switch sessions, restart the process, or call in as something that isn't an agent (no owner to be had), and an edit is refused outright as never observed until you read once. What it records is that this session saw the file, not a global truth about the file.",
+  "The version token includes the size and two nanosecond-precision timestamps. Even if an outside tool puts the content back exactly as it was, one of those timestamps has already moved, the guard calls it stale, and a re-read is required. That errs on the safe side, but it produces collateral refusals that from the model's point of view read as being rejected for changing nothing.",
+  "There are two containment tests: the one in the local backend is purely lexical, while the sandbox fence uses the one that falls back to device and inode numbers. The two don't share semantics, so the same aliased path can come in through the two entry points and get different verdicts.",
+  "File reads and writes have no timeout anywhere — no timeout field in the tool parameters, no deadline set by the backend, on the grounds that a timeout kills work the operating system is still going to finish. Cancellation depends on the tool execution's cancel signal taking effect on a best-effort basis at system-call boundaries, and a wedged disk read or write has nothing above it to fall back on."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/fs/fs/src/index.ts",
+   "note": "The abstract operation set and the signatures of the three filesystem events"
+  },
+  {
+   "path": "packages/fs/fs/src/types.ts",
+   "note": "The marked identity type, the write-intent union, and the thirteen error codes"
+  },
+  {
+   "path": "packages/fs/fs-local/src/index.ts",
+   "note": "The queue serialized by file identity, and checking plus writing inside the lock; the diff pre-read ceiling defaults to 10 MiB"
+  },
+  {
+   "path": "packages/fs/fs-local/src/fsio.ts",
+   "note": "Building an identity from the nearest existing ancestor, the version token, and the temporary directory plus atomic rename"
+  },
+  {
+   "path": "packages/fs/fs-sandbox/src/index.ts",
+   "note": "Re-resolve before the write, then fence, then hand the new identity to the parent"
+  },
+  {
+   "path": "packages/fs/fs-sandbox/src/containment.ts",
+   "note": "The lexical fast path with a device/inode fallback"
+  },
+  {
+   "path": "packages/fs/fs-observation-policy/src/index.ts",
+   "note": "Recording observation state per session, and holding the single slot that produces the intent"
+  },
+  {
+   "path": "packages/fs/tool-fs/src/write.ts",
+   "note": "Tool side: get the intent, write, record the observation, compute the diff hunks"
+  }
+ ],
+ "related": [
+  "sandbox",
+  "tools",
+  "shell",
+  "cordis-core"
+ ]
+}

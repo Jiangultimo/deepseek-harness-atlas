@@ -1,0 +1,222 @@
+{
+ "id": "compaction",
+ "lede": "Run a conversation long enough and it hits the context window — anyone building agents knows that. The real trouble isn't hitting it; it's the subtraction you have to do afterward. And the user has already read this history line by line, while dozens of turns of tool calls are still interlocked with their results. Delete the wrong one and the server bounces your next request on the spot.\n\nSo \"compaction\" is a slightly misleading word. It sounds like cleanup; in practice it's closer to bookkeeping. You can't tear out the previous page, you can only write a reversing entry on the next line, noting that from here on a new accounting applies.\n\n**Everything about this design follows from one sentence: delete nothing, just append one more entry to an append-only record — from here on, this stretch counts as this summary.**",
+ "packages": [
+  "packages/compaction/compaction",
+  "packages/compaction/compaction-basic",
+  "packages/compaction/compaction-tool-result-pruner",
+  "packages/compaction/command-compact",
+  "packages/llm/token-meter",
+  "packages/core/session"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "One log, two readers",
+   "body": [
+    "A conversation history has to serve two readers at once. People want the whole thing; the model wants it compacted.",
+    "The two demands fight each other. A user scrolling back wants the full output of that command exactly as it was; on the model side, you'd love to cut the same stretch down to three lines.",
+    "The usual approach is to keep two copies: a raw record for the interface, a trimmed message array for the model. Once the two stores split apart you start syncing them, and you have to handle things like the user scrolling back to dig up old entries — that's where a whole class of bugs comes from.",
+    "There is no second copy. There's one log, append-only, each entry carrying an increasing sequence number. Three kinds of events in it — user messages, assistant messages, tool results — fold down into the message list sent to the model. Call that folded, ordered result the \"model view.\"",
+    "The key part: every event that can enter the model view has to carry a marker of its own — either append to the end, or replace one continuous stretch of the view.",
+    "What compaction actually does is append a new user message marked \"replace from here to there.\" When the fold runs, the old stretch drops out and the new node takes its place. Nothing leaves the log.",
+    "The transcript rendered for people only accepts events that came in as appends. Which means the summary produced by that replacement is invisible to the user — it exists only for the model.",
+    "That has a fairly counterintuitive consequence: sequence numbers in the view are no longer monotonically increasing. A very new summary sits in a very old position. So every range here is understood in terms of view position, and \"start number greater than end number\" is a perfectly legal state.",
+    "There's one more check on write: a replacement event has to list, one by one, every node it covers over; miss one and the write is rejected. That way any replay can reconstruct exactly which events a given summary came from.",
+    "**What the model sees and what the person sees are two ways of folding the same event stream — not two stores.**"
+   ]
+  },
+  {
+   "heading": "Prevention and rescue have opposite temperaments",
+   "body": [
+    "When should you compact?",
+    "\"Almost full\" is an estimate. \"Already full\" is a fact. The risks you can afford in those two situations are completely different — and yet most implementations handle both with one threshold and one piece of code.",
+    "This splits them into two paths.",
+    "The preventive one hangs off the start of every step: look at the record of the last request actually sent, pull the provider and model out of it, ask how big that model's window is, multiply by a ratio (0.8 by default) to get a threshold, and compare against the current measurement. Under it, do nothing.",
+    "What's worth watching here isn't the 0.8 — it's that this path is allowed to fail. Can't find the model's capacity, can't compute a threshold: each just logs a warning, and the step proceeds as usual. One warning per model, so it doesn't flood the output.",
+    "The rescue path hangs off request failure, and it recognizes exactly one kind of failure: the adapter first normalizes the server's assorted error text, through a set of regexes, into the single code for \"context overflow.\" Nothing else triggers it. This path checks no threshold and reserves no budget — it compacts as much as it can.",
+    "The two paths are opposite in temperament:",
+    "- Prevention: allowed to guess wrong, allowed to do nothing; failure leaves a warning and that's it",
+    "- Rescue: the request is already dead, so it has to actually get the size down, and by default it gets one shot",
+    "The rescue counter resets in two cases: the turn returns to idle, or another assistant message comes back successfully. The latter means requests are getting through again, so the next overflow ought to start from a full budget.",
+    "There's a third entry point, the one a person types by hand. It ignores the threshold but demands that the whole agent be completely idle; after compacting it waits for a flush to disk before returning, and it translates each class of failure into a plain sentence.",
+    "**Put the same action in the preventive slot and the rescue slot, and even the answer to \"what do we do when it fails\" comes out reversed — which says they should never have shared one policy.**"
+   ]
+  },
+  {
+   "heading": "The cut can't land between a call and its result",
+   "body": [
+    "A conversation isn't a string you can cut anywhere you like.",
+    "A tool-call block inside an assistant message and the matching tool result that follows are a pair. Cut between them and the model receives a call that was issued and never came back; servers are usually not gentle about it and reject the entire request.",
+    "The usual approach is to cut by message count, or by boundary markers like \"step started / step finished.\" The first breaks pairs; the second looks much safer but doesn't work either — why, in a moment.",
+    "Its selection runs in two steps.",
+    "First, walk backward from the tail of the view adding up each node's estimated price until the total reaches the retention budget (16% of the window by default). That position is the start of what gets kept. What's kept is always the most recent conversation; what's compacted is always the oldest.",
+    "Then back up from that start to find the first balanced position. Balance is decided by an in/out count taken in view order: an assistant message adds one for each tool-call block it contains, a tool result subtracts one, and the cut can only land where the count is zero.",
+    "Note that it counts content, not boundary markers. That's the answer to the question above — replacement rearranges view positions, so position-dependent markers go stale, while an in/out count holds under any ordering.",
+    "If it backs all the way up without finding a legal cut point, or the retention budget already swallows the entire view, it returns \"not compacting this time\" instead of forcing an illegal range. The rescue path, reserving no budget, usually gets the longest stretch.",
+    "The counting result is cached per session along with the replacement generation at the time: same generation, and it only folds the newly appended tail; changed generation or a shortened view, and it rebuilds the whole thing. If the fold meets a tool result with no matching call, it throws — treating the view as corrupt rather than skipping past it.",
+    "**When things have to stay paired, the test belongs on the content, not on the position.**"
+   ]
+  },
+  {
+   "heading": "Finish the free half first",
+   "body": [
+    "A summary costs a model call, and it can fail.",
+    "The model might come back with an image, might hit the output limit and get truncated, might just time out. To be blunt, you're forced to spend money again at exactly the moment you most need to save it, with no guarantee it works.",
+    "The usual approach is to call the model for a summary the moment the threshold is crossed.",
+    "Before summarizing, it runs a deterministic, free reduction first: cut the middle out of over-long tool results. By default anything past 8192 code points gets cut, keeping the first 4096 and the last 1024, with a fixed marker in between.",
+    "Cutting by code points rather than UTF-16 units means surrogate pairs don't get split. Head plus marker plus tail must not exceed the threshold — that cross-field constraint is checked when the plugin loads, not left until some model first hits pressure and a warning reveals the configuration contradicting itself.",
+    "Each replacement writes a pruning record first, stating what the replaced node was worth in tokens under the shared pricing, and then appends the replacement event immediately after it. The two must be adjacent — that's a shared protocol: a consumer reading the log once can just subtract that number, without caching a price for every node itself. Summary compaction uses the same protocol.",
+    "The session layer puts an extra limit on this kind of replacement: one node at a time, and every field except the content must be identical character for character. In other words, a replacement can't quietly change a call id or any other metadata.",
+    "The trimmer is an optional plugin; if it isn't there, things go straight to summarizing. On the pressure path it re-measures after it runs, and often the number has already dropped back under the threshold, so the model call is skipped entirely.",
+    "The most interesting part is a test this drags along with it. On the rescue path, if the trimming already landed and only the summary step failed, was the round wasted or not? What it looks at isn't whether something threw — it's whether the session's replacement generation actually moved forward by one. If it did, real size came off, so retry immediately; only if it didn't does the original error go back to the loop.",
+    "**Finish the free, deterministic, can't-fail half first, and the failure surface of the other half shrinks on its own.**"
+   ]
+  },
+  {
+   "heading": "Why the summary doesn't start from scratch",
+   "body": [
+    "Summarizing looks like a standalone task — \"summarize this conversation\" — and it's natural to want a dedicated system prompt for it.",
+    "But the server's prefix cache hits on a literal prefix.",
+    "Swap in a different system prompt and this helper call shares no prefix with the main conversation, so the whole cache is void. A compaction done to save money becomes the most expensive call in the session.",
+    "It goes the other way: carry over the last request's system prompt and tool list verbatim, follow them with the messages the compacted range projects on its own, and only then append a user message carrying the compaction instruction. That makes the helper call, literally, a prefix of the main request.",
+    "The instruction demands eight fixed sections: original intent, key technical concepts, files and code involved, errors and fixes, pending work, current work, next step, key context. Empty sections say \"none\" and may not be dropped.",
+    "It also asks for one thing explicitly: if a checkpoint left by an earlier compaction is already sitting in the history, don't copy it through — merge it into one. Otherwise, a few rounds in, you have summaries nested inside summaries.",
+    "Only text is accepted back. An image counts as failure outright, because what gets assembled at the end is a single user message; hitting the output limit and getting truncated counts as failure too — better not to compact this time than to keep a truncated checkpoint.",
+    "Finally the summary is wrapped in a preamble and a pair of tags and assembled into the user message. One hard check remains before commit: this message's estimated price must be strictly less than the content it covers over, or the whole transaction is void.",
+    "**If a helper call can't grow into a literal prefix of the main call, it very likely spends more than it saves.**"
+   ]
+  },
+  {
+   "heading": "Write the lock into the log, not into memory",
+   "body": [
+    "The summary step is asynchronous and can run for several seconds.",
+    "In those seconds the conversation may continue, or something else may push into the context. Commit a range computed from a stale view and you can easily commit it to a position that no longer exists.",
+    "The usual approach is a mutex in memory plus a \"compaction in progress\" boolean. Good enough — but only for the current process.",
+    "It writes the brackets into the log instead: one compaction leaves three records — start, summary, end. All three go only into the log, never into the model view, and by themselves change nothing the model sees; what actually changes the view is the replacement user message that follows the summary.",
+    "The start record is the lock. Deciding whether a compaction is in progress means scanning back from the tail of the log: hit an end first and there isn't one, hit a start first and there is — unless a record marking the beginning of a new session lifecycle sits in between, which means that start belongs to the previous lifecycle.",
+    "There is no async yield at all between the check and writing the start record, so the lock is already in the log before the first yield. After that, any failure makes exactly one attempt to write an end record carrying the error; when even the end can't be written, it deliberately leaves an unpaired start behind, so the abnormal state stays visible instead of being quietly smoothed over.",
+    "The stability test before commit is tiered. Automatic compaction requires the entire view to be unchanged node by node, down to each node's estimated price; manual compaction only requires that the selected stretch is still there, still contiguous, still equivalent, and still balanced at both ends — other context injected in the meantime doesn't count as a conflict.",
+    "That distinction earns its keep: during a manual compaction the user is quite likely adding things, and one append outside the range shouldn't void a model call that's already been paid for.",
+    "Failures come in six classes, and the command layer translates each into a plain sentence that says two things: whether the conversation was modified, and whether the attempt was left in the log.",
+    "**A lock in memory holds only for the current process; written into the record of what happened, it can be replayed, seen across processes, and audited after the fact.**"
+   ]
+  },
+  {
+   "heading": "The number behind the threshold is a guess",
+   "body": [
+    "You have to decide whether a request will overflow before you send it, but only the server's tokenizer knows the exact token count, and it doesn't tell you until after the request.",
+    "The usual approach is to pull in a tokenizer library and count locally, or just eyeball it by character count.",
+    "It does neither. Metering is a separate service that replays the log per session and maintains three things: the current request envelope (system prompt plus tool definitions), an estimated price for every node in the view, and an anchor.",
+    "The estimate is a fixed heuristic: text at 4 characters per token, plus 4 of structural overhead per content block, plus 4 of role overhead per message; a tool call counts its name plus the argument string, and a tool result recurses into what's inside. No actual tokenization.",
+    "The anchor comes from usage the server really reported. Every time an assistant message arrives with usage attached, it records the request envelope and the view's total price at that moment.",
+    "But it trusts that ground truth under one condition only: the total the server reports is not below the heuristic estimate for the same content. Lower, and it falls back to the estimate — because what gets layered on afterward are signed deltas, and the addition is only conservative if it starts from a baseline that isn't below the estimate.",
+    "Measurement after that is the baseline plus the signed change in the view since the anchor. Change the request envelope — a different model, an edited system prompt — and everything is re-estimated, the anchor voided.",
+    "The view fold is signed here too: the delta for a replacement is the new node's price minus the sum of prices for the stretch removed. So the moment a compaction lands, re-measuring reflects the reduction immediately — which is exactly what the preventive path uses to decide whether to compact again.",
+    "**What matters isn't whether the number is accurate — it's that the whole system has only this one number. Three numbers, each more precise but disagreeing with each other, are far worse than one shared approximation.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Don't delete history; cover it with a layer",
+   "how": "The usual approach keeps a separate trimmed message array for the model and a raw record for people — two stores, and then you start syncing them. This has one log that can be appended to and never deleted from: events that can enter the model view carry a marker of their own, either append to the end or replace one continuous stretch of the view. Compaction is appending a new user message marked as a replacement; when the fold runs the old stretch drops out and the new node takes its place, and not one log entry is deleted. That replacement event also has to list every node it covers over, one by one, checked one by one on write — miss one and the write is rejected.",
+   "why": "Compaction is therefore replayable and auditable; the interface renders only events that came in as appends, so nothing the user has already read vanishes because of a compaction."
+  },
+  {
+   "name": "Prevention and rescue take two different paths",
+   "how": "The usual approach is one threshold and one piece of code: over the line, compact. This splits into two. The preventive path runs before every step: look up the model's window, take 0.8 of it as the threshold, reserve a stretch of tail budget, and on any error just log a warning and carry on. The rescue path runs only when a request fails and the error text normalizes to the single code for \"context overflow\": no threshold, no reserved budget, a default cap of one attempt, with the counter reset when the turn goes idle or another assistant message comes back. More important is its retry test — not whether something threw, but whether the session's replacement generation moved forward by one.",
+   "why": "Trimming landing while only the summary fails is the most common kind of half-success; counting by exception throws that real reduction away entirely and burns one of the already scarce retries for nothing."
+  },
+  {
+   "name": "The cut has to leave a call and its result on the same side",
+   "how": "The usual approach cuts by message count, or leans on boundary markers like \"step started / step finished.\" This walks backward from the tail of the view adding up estimated prices until it reaches the retention budget (16% of the window by default) to get the retention start, then backs up from there to find the first position where the in/out count of tool calls and results is zero, and cuts there. It counts content rather than markers, because replacement rearranges view positions and position-dependent markers go stale. The result is cached per session along with the replacement generation at the time; same generation, and only the new tail gets folded. If it backs all the way up without a legal cut point, or the budget already swallows the whole view, it returns \"not compacting this time\" rather than forcing a cut.",
+   "why": "Cut between a tool call and its result and the model receives a call with no result, which servers usually answer by rejecting the entire request."
+  },
+  {
+   "name": "The free reduction goes before the paid one",
+   "how": "The usual approach calls the model for a summary the moment the threshold is crossed. This first runs a reduction that costs nothing and can't fail: tool results over 8192 code points are cut down to the first 4096 and the last 1024 with a fixed marker in between; cutting by code points keeps surrogate pairs intact; the cross-field constraint that the three parts must not exceed the threshold is checked at load time. Each replacement writes a record first, stating what the replaced node was worth in tokens under the shared pricing, then appends the replacement event immediately after — the two adjacent records form a shared protocol, so a consumer reading the log once can just subtract that number. It re-measures afterward, and if the number is back under the threshold the model is never called at all.",
+   "why": "A deterministic reduction costs nothing, doesn't fail, and reproduces exactly; putting it first both saves the call and shrinks what enters the summary stage."
+  },
+  {
+   "name": "Make the summary call grow into a prefix of the main call",
+   "how": "The usual approach gives the summary a dedicated system prompt and pastes the content to be compacted into it. This does the reverse: carry over the last request's system prompt and tool list verbatim, follow them with the messages the compacted range projects on its own, and only then append the compaction instruction, so the helper call is literally a prefix of the main request. The instruction demands eight fixed sections, empty ones written as \"none,\" and explicitly asks that a checkpoint left by an earlier compaction be merged rather than copied through. Only text is accepted back; an image, or truncation at the output limit, counts as failure. Before commit the assembled user message faces one hard check: its estimated price must be strictly less than the content it covers over.",
+   "why": "A different system prompt voids the server's prefix cache entirely, turning a compaction meant to save money into the most expensive call; the shrinkage check blocks the backfiring commit where the summary is longer than what it replaces."
+  },
+  {
+   "name": "Write the lock into the log, not into memory",
+   "how": "The usual approach is a mutex in memory plus an in-progress flag. This writes three records — start, summary, end — all of which go only into the log, never into the model view. Deciding whether a compaction is in progress means scanning back from the tail of the log: hit an end first and there isn't one, hit a start first and there is. There is no async yield between the check and writing the start, so the lock lands before the first yield; after that, any failure makes exactly one attempt to write an end carrying the error, and when even the end can't be written it deliberately leaves an unpaired start behind. The stability test before commit is tiered: automatic compaction requires the entire view unchanged node by node, manual compaction only that the selected stretch is still there, still contiguous, still equivalent, and still balanced at both ends.",
+   "why": "A lock in memory holds only for the current process and can never be seen in a replay; the tiered test keeps context injected during a manual compaction from voiding a model call that's already been paid for."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Replace deleting history with appending a record that covers it over.",
+   "why": "Keep the log append-only and compaction becomes replayable, auditable, analyzable after the fact. The more practical part is that the model view and the human view can part ways here — the model sees the compacted version, the user still sees the full conversation — while both fold from the same event stream, so there are no two stores to maintain and none of that whole class of bugs where two stores disagree."
+  },
+  {
+   "lesson": "Hang the retry test on observable state moving forward, not on whether a call threw.",
+   "why": "Compaction has two stages, and the free trimming landing while the paid summary fails afterward is the most common kind of half-success. By exception, the whole round counts as wasted, the real reduction is thrown away, and one of the already scarce retries is spent for nothing; by whether the replacement generation moved forward one, that gain is kept."
+  },
+  {
+   "lesson": "Run the deterministic, free reduction first; touch the model second.",
+   "why": "Cutting the middle out of a tool result needs no model, can't fail, and reproduces exactly. Put it before the summary and in many cases the pressure is already back under the threshold, so the model call is skipped entirely; even when it isn't, what enters the summary stage is smaller, and that step's failure surface shrinks with it."
+  },
+  {
+   "lesson": "Make the helper call a literal prefix of the main call.",
+   "why": "The server's prefix cache hits by literal comparison. If the summary swaps in a different system prompt, the shared prefix drops to zero, the whole cache is void, and a compaction meant to save money becomes the most expensive call in the session. Reuse the existing system prompt and tool list, append the instruction only at the end, and the cache keeps hitting."
+  },
+  {
+   "lesson": "When things have to stay paired, test the content, not position markers.",
+   "why": "A tool call and its result have to stay on the same side of the cut, and the way to decide that is by counting call blocks inside assistant messages against the result events that follow, not by leaning on boundary markers like \"step started / finished.\" Compaction rearranges view positions and position-dependent markers go stale; a content-based in/out count holds under any ordering."
+  }
+ ],
+ "tradeoffs": [
+  "The token count isn't real tokenization; it's a fixed 4-characters-per-token formula plus an anchor from server-reported usage. The threshold, the retention budget, and the \"the summary must be smaller\" test all rest on that approximation, and it skews in different directions for code, Chinese, and dense JSON — the same threshold leaves noticeably different real headroom from task to task.",
+  "It can only replace whole nodes; it can't take a message apart. So a single enormous node, or a system prompt plus tool definitions that blow out the window on their own, leaves the mechanism with nothing to do — and the latter is exactly what you hit once you've installed too many tools.",
+  "A failure on the preventive path logs one warning and the step continues, so a request can go out with context already past the threshold, pushing the problem to the rescue path. The choice itself is right — prevention shouldn't interrupt a turn — but it means a misconfiguration can hide for a long time, showing up only as \"one extra failure now and then.\"",
+  "The summary must be strictly smaller than the content it covers, and truncation at the output limit counts as failure. When the history is already compact, or the selected range is short, it can fail to move round after round and end up throwing \"still above the threshold.\" That's the trade of rather-not-compact over compact-wrong, but what the user sees is \"compaction didn't work.\"",
+  "The log only grows. What compaction brings down is cost on the model side; session file size, replay time, and the cost of folding the view all grow rather than shrink. In other words, it trades a bounded inference cost for a continuously growing storage cost.",
+  "Manual compaction requires the agent to be completely idle with no open turn; while it's busy the request is refused outright rather than queued. And tool results are cut by code point, which guarantees surrogate pairs stay intact but can still split a grapheme cluster; the deleted middle is unrecoverable for the model, even though the original event is still sitting in the log."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/compaction/compaction/src/index.ts",
+   "note": "The capability interface: three methods and the two trigger kinds"
+  },
+  {
+   "path": "packages/compaction/compaction/src/types.ts",
+   "note": "The four event kinds — start, summary, end, prune — and the result types"
+  },
+  {
+   "path": "packages/compaction/compaction/src/tool-pairing.ts",
+   "note": "The balance test for cut points and the per-session incremental cache"
+  },
+  {
+   "path": "packages/compaction/compaction-basic/src/index.ts",
+   "note": "Policy for both trigger paths, the automatic listener, and the retry test"
+  },
+  {
+   "path": "packages/compaction/compaction-basic/src/region.ts",
+   "note": "Range selection, the compaction transaction, the log lock, and the stability check"
+  },
+  {
+   "path": "packages/compaction/compaction-basic/src/summarizer.ts",
+   "note": "The prefix-reusing summary call and the checkpoint wrapping"
+  },
+  {
+   "path": "packages/compaction/compaction-tool-result-pruner/src/index.ts",
+   "note": "Model-agnostic middle-out trimming of tool results (8192 / 4096 / 1024)"
+  },
+  {
+   "path": "packages/llm/token-meter/src/index.ts",
+   "note": "Pressure metering: a usage anchor plus signed view deltas"
+  }
+ ],
+ "related": [
+  "session",
+  "agent-loop",
+  "llm",
+  "tools"
+ ]
+}

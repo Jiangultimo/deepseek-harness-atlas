@@ -1,0 +1,217 @@
+{
+ "id": "bridges",
+ "lede": "You have a hook config written for some other tool — a few dozen lines, governing which script runs before a prompt gets submitted, and whether a given command gets intercepted before it executes. Now you've switched agent runtimes, and you want that config to run unchanged.\n\nThis sounds like the least technical piece of the whole system: read a file, assemble a payload, spawn a process, check the exit code. Translation work, nothing more.\n\nThe trouble is that every word in the outside vocabulary has to be pinned to an exact place on the inside — which interception point, which return semantics, which log line. Get one wrong and the symptom usually isn't an error. It's a rule that quietly stops applying, or an action that should have been blocked getting waved through.\n\n**The hard part of bridging was never the translation. It's that a bad translation doesn't make a sound.**",
+ "packages": [
+  "packages/acp/acp",
+  "packages/sdk/protocol",
+  "packages/sdk/server",
+  "packages/sdk/client",
+  "packages/hooks/hook-protocol",
+  "packages/hooks/hooks-claude-code",
+  "packages/hooks/hooks-codex",
+  "packages/mcp/mcp-client"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "A bridge's job is translation, not invention",
+   "body": [
+    "First, what this piece actually does. Four bridges, four directions facing outward —",
+    "- someone else's editor wants to drive it through a general-purpose protocol",
+    "- script hooks a user wrote for a different tool need to hang off its lifecycle",
+    "- another process wants to operate an entire runtime remotely, across a process boundary",
+    "- an outside tool server wants to push its own tools into its tool table",
+    "The directions all differ, but they land in only four places: the factory that creates and drives agents, the session event stream (every durable fact flows out of there), the tool registry, and a few interception points — before a model request goes out, before a tool runs, after a tool runs, and just as a turn is about to end.",
+    "The usual approach is to cut a dedicated hole in the core for every external protocol you take on. Support three protocols and the core carries three special cases, none of which knows the others exist, and nobody can say which one takes precedence.",
+    "Here it goes the other way: a bridge may not add any internal mechanism. Everything the four bridges can do, an ordinary plugin can do too — without serializing the data and sending it out on a round trip first.",
+    "**So these bridges are a compatibility path, not a path for adding capability.**",
+    "The repo docs put it bluntly: any custom behavior should be written as a plugin on an extension point. The hook bridges exist for exactly one reason — so the config a user already wrote for another tool runs unchanged.",
+    "Let that stance slip and a bridge starts growing capabilities you can only get by coming in through the bridge, and then everyone is forced to come in through the bridge. A bridge is there to interpret, not to write extra lines for the speaker."
+   ]
+  },
+  {
+   "heading": "Two dialects, three real differences",
+   "body": [
+    "There are two hook config formats to support. Laid out side by side, the field names differ, the matching syntax differs, and the decision words they claim differ too. They look like two separate things.",
+    "The usual approach is to copy one and edit it. The two implementations are identical the day they split; six months later one has a ten-minute default timeout and the other has five, and nobody remembers who changed it.",
+    "Here a dumber question came first: how many places do these two formats actually differ?",
+    "Three — how the matching semantics are read, whether the input written to the child process gets a trailing newline, and which fields get claimed. Everything else is shared: deciding whether an entry selects the current event, decoding exit code and output into a neutral result, running the command, folding several results into one, writing logs, and tracking the runs nobody is waiting on.",
+    "Take matching. One dialect says that when a pattern is made only of letters, digits, underscores, and pipes, the pipes are alternation separators and each candidate is compared for exact equality; anything else is an unanchored regex. The other treats everything as a regex. Once that difference reaches the core, it's just a parameter.",
+    "Running the command doesn't spawn a process directly either — it goes through the repo's own shell capability and gets that capability's credential scrubbing, process-group cancellation, and timeouts for free. Timeouts in the config are in seconds, because that's the unit of the external protocol, and the core converts to milliseconds. With none given it uses the ten minutes from the protocol's reference implementation, and both dialects point at the same constant.",
+    "**Drift between two implementations is never a decision anybody makes — it's something everybody forgets. Collapsing the difference into a parameter doesn't buy you fewer lines. It buys you a difference nobody can forget.**"
+   ]
+  },
+  {
+   "heading": "One bad rule doesn't get to take down a run",
+   "body": [
+    "Hook scripts are written by the user, not by you. One might emit half a JSON object, might get killed by a signal, might write \"deny\" in a place where a denial has no business appearing.",
+    "The usual approach has two extremes: either a parse failure throws and one bad rule wrecks the whole turn, or everything gets swallowed and one bad rule quietly does nothing, and the user never learns they wrote it for nothing.",
+    "Here the work splits by timing: don't blow up at run time, blow up at load time.",
+    "A broken regex just returns \"no match\" during run-time matching, without throwing. But a separate check at config-parse time picks it out, so the bridge rejects the whole config before it attaches a single listener. A bad rule neither takes down a run nor fails silently.",
+    "The decoding rules are short enough to memorize: exit code 2 means block and the error output is the reason; exit code 0 with standard output starting on a left brace is the only case that tries to parse structured output, and a failed parse counts as no structured output at all, leaving the raw text for the bridge to use as plain text; every other exit code is a non-blocking error.",
+    "An execution failure doesn't take down the current turn either. The layer underneath throws only on genuine infrastructure failures — the working directory doesn't exist, no shell can be found — and the core turns that into a neutral result with no exit code, files the failure text into the error-output field for the record, and the turn keeps going. Being killed by a signal also maps to no exit code, because there genuinely isn't a clean code to decide anything with.",
+    "The permission part is the most interesting. The external format has two independent decision channels; the core folds them into one enum but keeps the difference in what each channel is allowed to say. The top-level one recognizes only \"approve\" and \"block\", while \"allow / deny / ask\" can come only from the per-event blocks. A \"deny\" written at the top level is ignored outright — not read as a denial, read as if it were never written.",
+    "Structured output also carries an event name it claims for itself. When that name doesn't match the current event, the core drops every event-level field in the block but records the claimed name in the result — the log has to show who the block was meant for.",
+    "**You can be lenient about format. You can't be lenient about permission: whether a field can change an authorization depends on where it's written, not on what it says.**"
+   ]
+  },
+  {
+   "heading": "The mapping table is only half; the other half is discipline",
+   "body": [
+    "Wiring an external decision into an internal interception point looks like a table lookup: deny maps to deny, ask maps to ask.",
+    "The hard part is that these interception points don't all have the same shape. Some are chains you can intercept and rewrite, but you have to keep passing control down the line, because other people's listeners hang behind you. Some are serial. And some have nobody waiting on your return value at all.",
+    "The usual approach: I got a decision, I return the decision, done. On an interceptable chain, that amounts to deciding on behalf of everyone behind you.",
+    "The discipline here is narrower: short-circuit only when a hook explicitly says \"deny\". If it merely wants to add some context, the bridge has to hand control onward first, collect the conclusion from the listeners behind it, and then append the context to the \"go ahead\" branch.",
+    "**Someone who only wants to add a sentence has no standing to cancel everyone else's right to rewrite.**",
+    "The mapping itself carries dialect differences. Before a tool runs, deny becomes deny and \"ask\" becomes needs-confirmation — the other dialect has no notion of asking at all, only blocking. After a tool runs, deny becomes a block carrying feedback. When a turn is about to end, a stop hook that intercepts makes the bridge feed the reason in as a steering message, so the machine sees there's still pending input and runs another step.",
+    "The three points where nobody waits on the return value are the easiest to miss. The bridge registers the whole chain — run, then follow-up handling, then error catching — into a tracker. On plugin disposal it fires the abort signal first to kill any still-running process, otherwise you'd wait out the full ten-minute default timeout, and then waits repeatedly until the in-flight set is genuinely empty. Waiting repeatedly is required, because new chains can still get registered while one round is settling.",
+    "Every invocation also lands a pair of durable records: one saying who got selected at which point by which pattern, and one under the same identifier saying what it decided, its exit code, its truncated error output, and its wall-clock time. Multiple hooks at the same point run serially for exactly one reason: so that pair sits adjacent in the log.",
+    "**Half of a bridge's correctness lives in the mapping table. The other half lives in whether it kept the host's calling discipline.**"
+   ]
+  },
+  {
+   "heading": "It doesn't pretend to own the turn",
+   "body": [
+    "The automation protocol has a requirement: the client sends a prompt, and the server must eventually return a stop reason telling it why this one ended.",
+    "That sounds natural, until you notice you aren't the only one creating turns in the runtime. Other plugins, other producers, can all push a new turn onto the same agent. Which turn did your message actually trigger?",
+    "The usual approach is to pretend: whichever turn ends first is mine. Most of the time that's right, and when it's wrong you can't trace it.",
+    "Here correlation gets established first and settlement comes after. The bridge installs the in-flight slot before it delivers the message — reverse that order and a synchronously triggered turn can finish before the correlation exists — and then an enqueue-claim event binds the message to a specific turn number. If the matching turn ends on a model error, the request is rejected immediately; otherwise the end reason is only recorded, and settlement waits until the whole machine goes idle.",
+    "More importantly, it admits the part it doesn't know. A slot that never got a turn number — because the prompt was never admitted, say — reports \"cancelled\". An ending like hitting the token limit doesn't count as a prompt-level stop reason, so it reports a normal end.",
+    "**The settlement rules are honest rather than precise. The bridge never claims to own a turn, so it never invents a stop reason either.**",
+    "Approvals ride the same line. The bridge takes over only requests on agents it owns that carry a tool-call identifier, and passes everything else along. It offers the client exactly two options — allow this once, deny this once — and if the client answers \"cancelled\", that gets relayed as-is. No answer is ever inferred into a standing authorization: an automation client may reply automatically by policy, but an unknown client shouldn't have the power to hand out long-lived permissions.",
+    "The outbound direction is subtracted from too: only text blocks inside a committed assistant message become a message chunk (image blocks degrade to a line of placeholder text), while raw deltas, reasoning, tool activity, plans, titles, and retry markers all stay in the session log and never reach the automation line. That trades token-by-token latency for a result that can't leak a half-finished draft.",
+    "The order of the teardown path isn't arbitrary either. Client disconnect and plugin disposal share one teardown task: cancel every agent and settle every in-flight request synchronously first, and only then start waiting — because the next step, draining the resumable descendants, can sit blocked on persistence for a long time. Reverse the order and the top-level agent keeps issuing model requests and running tools through the entire drain."
+   ]
+  },
+  {
+   "heading": "No cancel in the protocol, so a timeout is only giving up",
+   "body": [
+    "Driving a whole runtime across a process boundary has a plain transport layer: line-delimited framing, one compact JSON frame per line. Classification looks at two fields only — carrying both an id and a method name makes it a request, an id alone makes it a response, a method name alone makes it a notification. Malformed lines are ignored. A method nobody handles gets back the standard \"no such method\" error, and a handler that throws gets back an \"internal error\". Closing only detaches listeners and rejects in-flight requests; it doesn't destroy the caller's streams.",
+    "There are only three methods: a process-level handshake (fixing the working directory, the provider and model routing, and an optional output cap), a delivery of a user message, and a shutdown. There are four notifications: session events, whole-machine busy and idle, and sub-agent start and end.",
+    "The delivery one is where it matters: what comes back is an enqueue receipt, not a result. The server attributes no assistant message and no ending to that prompt. Session events aren't filtered either — every session's events in the runtime get pushed out, and scoping is computed locally by the client from the sub-agent start events.",
+    "And then the thing that's easiest to overlook: there is no cancel on this line at all.",
+    "The usual approach makes a client-side timeout look like a cancel — time runs out, a timeout error is raised, and everyone assumes the other side stopped too. That's the most expensive kind of misunderstanding, because it makes people believe the resources have already been reclaimed.",
+    "Here it's said out loud: a timeout only means \"I've stopped waiting.\" The abort signal deletes the pending entry from the table and rejects the caller, so hammering a hung method with repeated requests doesn't accumulate per-call residue — but the work on the server side runs right along. If you actually want to abandon a turn, the only way is to shut down the entire runtime process.",
+    "So shutdown is built as a full staircase: make a best-effort shutdown request (one second by default), then close its standard input, then send the terminate signal, then kill it outright, until the process really exits. That staircase is private to this client, because it runs outside the whole apparatus and can't reach the repo's subprocess capability.",
+    "Diagnostics follow the same premise: the client keeps a bounded tail of error output, and before sending a request it checks whether the child process already has an exit code or failed to start at all. If so, it waits for the streams to settle and then throws an error carrying the exit code and that tail. Otherwise you're just writing into a pipe that's already been destroyed, and hanging all the way to the timeout.",
+    "**Giving \"I've stopped waiting\" and \"it stopped\" separate names looks like a wording problem. It's actually the difference between handling a failure correctly and not.**"
+   ]
+  },
+  {
+   "heading": "The name is the only currency that crosses the border",
+   "body": [
+    "An outside tool server wants to push its tools into the local tool table. That sounds like plain forwarding, until you look at what the model side allows in a function name: letters, digits, underscores, and hyphens only, at most 64 characters.",
+    "The usual approach substitutes the illegal characters and truncates anything too long. So two tools with entirely different identities can normalize down to the same name. The model calls one, you execute the other — and that kind of accident raises no error whatsoever.",
+    "Here every tool gets two names. What goes out on the wire is always the server's own original name; what the model sees is a public name made of three joined parts. The public name is a pure function of those two names: when nothing is dirty it's just the joined result, and the moment character substitution or truncation changes that result, a 12-digit hexadecimal identity hash gets appended at the end (with a null character inserted between the two names before hashing).",
+    "And the public name is never parsed back. A call uses the original name that was held onto the whole time, not something reconstructed from the public one.",
+    "**A name that crosses a boundary is either an injective pure function, or you shouldn't expect to recover anything from it.**",
+    "Swapping generations of the tool table is deliberate too. The first phase fetches the whole paginated listing and builds the entire next-generation definition; any failure along the way — the network dropped, the server listed the same name twice — throws immediately, and the previous generation's registration stays untouched. Only the second phase disposes of the old generation and registers the new one, and if the namespace has been taken by an outside registration it rolls the whole generation back and complains loudly. Every sync queues on the same line, so two swaps can't interleave.",
+    "Put another way: the tool set the model sees is either a complete generation or still the previous one, never half of either.",
+    "Reconnection is bounded exponential backoff, but how the budget gets counted is worth a sentence: one outage shares one attempt budget, and it resets only after a connection stays up longer than the backoff ceiling. So a server that keeps crashing and briefly reconnecting each time still exhausts the limit instead of restarting forever, and an exhausted budget deregisters all of that server's tools.",
+    "One more trade-off sits in content extraction: the copy that enters the model context keeps text only, and image, audio, and resource blocks become placeholders — but the canonical value at the execution site still holds the original blocks. The loss happens only in the copy the model sees."
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "When hooks disagree, listen to the harshest one",
+   "how": "The usual approach lets the last hook win, or the first one — both are order-sensitive, so reordering the config changes the outcome. Here each decision carries a severity: deny and block score 3, ask scores 2, approve and allow score 1, no opinion scores 0, and the maximum folds into a single enum. Reasons are bucketed by level and only the winning level's reasons are emitted, joined by blank lines, so an ask reason that a denial overrode never mixes into the final explanation. The first hook asking for a full stop sets the stop reason and isn't overwritten afterward. Additional context and system messages accumulate in order into arrays rather than being concatenated, leaving the bridge to decide how to use them.",
+   "why": "Only because the decision is insensitive to execution order can the bridge afford to run hooks serially and keep an invocation's two log records next to each other."
+  },
+  {
+   "name": "Work nobody waits on still needs an owner",
+   "how": "At three points — session start, sub-agent start, and sub-agent end — nobody waits on the return value. The usual approach is fire and forget, which leaves a pile of async side effects in flight at plugin disposal with nobody able to say when they land. Here the whole chain — run, then follow-up handling, then error catching — gets registered into a tracker. Disposal fires the abort signal first to kill any still-running process, otherwise you'd wait out the full ten-minute default timeout, then loops on waiting until the in-flight set is genuinely empty. The loop is required, because new chains can still get registered while one round is settling.",
+   "why": "So that \"the plugin is disposed\" means \"this bridge's async side effects have gone quiet\", not \"we stopped looking at them\"."
+  },
+  {
+   "name": "Establish correlation first, settle afterward",
+   "how": "The protocol requires a stop reason for every prompt, but other parties can push new turns onto the same agent. The usual approach claims the first turn that ends and bets it was yours. Here the in-flight slot is installed before the message is delivered — the other order lets a synchronously triggered turn finish before the correlation exists — and an enqueue-claim event binds the message to a specific turn number. If the matching turn ends on a model error the request is rejected immediately; otherwise the end reason is only recorded and settlement waits for the whole machine to go idle. A slot that never got a turn number reports cancelled.",
+   "why": "The bridge doesn't claim to own a turn, so it would rather give an honest approximation than invent a precise stop reason."
+  },
+  {
+   "name": "On a collision, append a hash",
+   "how": "The model side allows a limited character set in function names and caps them at 64. The usual approach substitutes illegal characters and truncates overlong ones, so two distinct identities can land on one name, with no error. Here the outward name is a pure function of the server name and the original name: clean cases are just the three parts joined; the moment character substitution or truncation changes that joined result, a 12-digit hexadecimal identity hash gets appended to the truncated name (with a null character inserted between the two names before hashing, so different splits can't produce the same string). The original name appears only in requests sent to the server, the outward name is never parsed back, and a call uses the original name held the whole time.",
+   "why": "Names don't collide even when normalization is lossy, and a name depends only on identity — not on connection order, resyncs, or what other servers are around."
+  },
+  {
+   "name": "The tool table swaps a whole generation or nothing",
+   "how": "The usual approach edits the registry while fetching: register each tool as it arrives, and a failure partway leaves half a set, putting the model's tool list in an intermediate state nobody designed. Here it's two phases — fetch the whole paginated listing and build the entire next-generation definition first, with any failure thrown in that phase and the previous registration untouched; only the second phase disposes of the old generation and registers the new one, rolling the whole generation back to zero tools and complaining loudly on a namespace conflict. The initial sync, a resync triggered by a list change, and a post-reconnect sync all queue on the same line, so two swaps can't interleave into a double disposal or a leak.",
+   "why": "The tool set the model sees is either a complete generation or still the previous one, never half of either."
+  },
+  {
+   "name": "A timeout only means I've stopped waiting",
+   "how": "The usual approach treats a timeout as though the other side stopped too, and plenty of clients never send a cancel request at all. Here the semantics get stated outright: this line has no cancel method, so a timeout is the client giving up unilaterally. The abort signal deletes the pending entry from the table and rejects the caller, so hammering a hung method with repeated requests doesn't accumulate per-call residue — but the work on the server keeps running. Actually abandoning a turn means walking the staircase: shutdown request, close standard input, terminate signal, hard kill, shutting the whole process down.",
+   "why": "Naming \"the client stopped waiting\" and \"the server stopped\" separately keeps a caller from mistaking a timeout for a cancel."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "If a difference can be expressed as a parameter, it shouldn't be expressed as a second implementation.",
+   "why": "The two hook formats differ in exactly three places: matching semantics, whether the input written to the child process gets a trailing newline, and which fields get claimed. Collapse those into parameters and execution, decoding, merging, and logging each get written once, so the two bridges can't quietly drift apart on a default timeout or a truncation rule — and drift is never a decision anybody makes, it's something everybody forgets."
+  },
+  {
+   "lesson": "A name that crosses a boundary is either an injective pure function, or you shouldn't expect to recover anything from it.",
+   "why": "Normalizing to a target character set and a length cap is necessarily lossy. Patching the lossy cases with an identity hash is what makes a name depend on identity alone rather than on connection order, and what keeps two identities from ever colliding. Which also means you shouldn't reconstruct the original name from the outward one — a call always uses the one that was held the whole time."
+  },
+  {
+   "lesson": "Someone who only wants to add a sentence shouldn't cancel everyone else's right to rewrite.",
+   "why": "Not passing control down an interceptable chain amounts to deciding on behalf of every listener behind you. The bridge short-circuits only when a hook explicitly denies; when it merely supplies context, the downstream conclusion comes first and the context is appended to the go-ahead branch. Otherwise a purely informational injection silently eats someone else's chance to intercept."
+  },
+  {
+   "lesson": "A reference the bridge is holding has to be checked against the current registry before delivery.",
+   "why": "Reloading just the agent loop disposes of the agents it governs while the reference the bridge remembers stays alive, and an already-disposed state machine will still silently accept a message. Both cross-process bridges compare the instance in the registry against the one they hold before delivering, turning a silent loss into an explicit error."
+  },
+  {
+   "lesson": "A disposal path stops the bleeding synchronously first, and does the possibly slow waiting second.",
+   "why": "Teardown cancels every agent and settles every in-flight request synchronously, and only then drains the resumable descendants — that step can sit blocked on persistence for a long time. Reverse the order and the top-level agent keeps issuing model requests and running tools through the entire drain."
+  }
+ ],
+ "tradeoffs": [
+  "The hook field that says \"stop the whole run here\" gets parsed and recorded into the durable result, but there is no run-level stop mechanism to carry it out. Whoever wrote the rule thinks they can abort the run; what they actually get is a log line, and both bridges carry the same open item. Stop hooks also have no consecutive-block limit, so a hook that blocks unconditionally forces another step every time, while the flag that was supposed to tell it \"you already blocked once\" is permanently false.",
+  "One of the two dialects covers only a small slice of the hook events: a tool-input rewrite gets parsed and warned about but has no effect; a system message likewise only warns and is never shown; and \"allow\" doesn't pre-approve anything. The config is read once at process load, with no layered discovery and no hot reload.",
+  "Multiple hooks at the same interception point run serially and without deduplication, where the upstream implementation runs them in parallel and dedupes. What that buys is the readable adjacency of the paired records in the log; what it costs is that the hooks' latencies add up directly. I think the trade holds up, but it is a trade, not something you get for free.",
+  "The cross-process line has neither a cancel nor a per-prompt result: delivery returns only an enqueue receipt, and the client has to define and watch an activity window itself. The only way to abandon a turn is to shut down the whole runtime process — there isn't even a per-session close.",
+  "The automation line sends only committed assistant text, so token-by-token latency is gone; and because it doesn't claim to own a turn, an ending like hitting the token limit never becomes a prompt-level stop reason and can only be reported as a normal end. Sessions can only be created, too — loading, resuming, and forking are all unsupported.",
+  "The outside-tool-server line bridges tools only; resources and prompts have no consumer. Image, audio, and resource blocks degrade to placeholders on the way into the model context. Connect and list timeouts use the 60-second default, so an unresponsive server slows down both activation and disposal."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/hooks/hook-protocol/src/codec.ts",
+   "note": "Dialect-neutral decoding of exit code and stdout, and what each of the two decision channels is allowed to say"
+  },
+  {
+   "path": "packages/hooks/hook-protocol/src/merge.ts",
+   "note": "deny/ask/allow ranked to the strictest, with reasons bucketed by level"
+  },
+  {
+   "path": "packages/hooks/hook-protocol/src/runner.ts",
+   "note": "Seconds-to-milliseconds conversion, DEFAULT_HOOK_TIMEOUT_MS = 600_000, execution through the shell capability"
+  },
+  {
+   "path": "packages/hooks/hooks-claude-code/src/index.ts",
+   "note": "The CC dialect's payloads and environment variables, plus the decision mapping onto internal extension points"
+  },
+  {
+   "path": "packages/acp/acp/src/index.ts",
+   "note": "ACP session lifecycle, prompt settlement, one-shot approvals, and teardown"
+  },
+  {
+   "path": "packages/sdk/protocol/src/transport.ts",
+   "note": "Line-delimited JSON-RPC endpoint, including abort-signal-driven give-up"
+  },
+  {
+   "path": "packages/sdk/client/src/client.ts",
+   "note": "Child-process ownership, notification subscriptions, timeouts, and the shutdown staircase"
+  },
+  {
+   "path": "packages/mcp/mcp-client/src/tools.ts",
+   "note": "Injective construction of publicToolName (64-character cap plus a 12-digit hash) and the two-phase fetch-then-swap sync"
+  }
+ ],
+ "related": [
+  "agent-loop",
+  "tools",
+  "session",
+  "subagent"
+ ]
+}

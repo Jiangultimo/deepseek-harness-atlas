@@ -1,0 +1,205 @@
+{
+ "id": "cordis-core",
+ "lede": "Anyone who has built a plugin system probably knows the feeling: the loading half goes down smoothly, and the unloading half is a mess.\n\nA plugin gets swapped out mid-run. The services it registered have to disappear, the listeners it hung have to come down, and the few other plugins currently using it have to restart along with it — in the right order. Miss one and you leak; do one twice and you crash; get the order wrong and you're holding a dangling reference.\n\nMost frameworks hand that discipline to the plugin author, along with a line of documentation: remember to clean up.\n\nIts choice was to push three things down into the syntax itself — registering something hands you back a receipt you can tear up; whether your dependencies are all present is squashed into one comparable string; a service called across a plugin boundary automatically carries the caller's identity. Seven files, twenty-four hundred lines, and those three things are the whole job.\n\n**It doesn't lay down a set of lifecycle rules to obey — it deletes the rule-breaking way of writing from the syntax.**",
+ "packages": [
+  "vendor/cordis"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "\"You clean up what you create\" doesn't go far enough",
+   "body": [
+    "The hard part of a plugin system isn't loading. It's unloading.",
+    "Loading is a single event: install it, start it, done. Unloading is scattered — registered services have to vanish from the table, listeners have to come down, timers have to stop, connections have to close. Those actions live in four or five different places, hundreds of lines apart.",
+    "Miss one and you leak. Do one twice and you crash.",
+    "The usual answer is to give the plugin an unload hook and ask the author to write every registration down a second time. It works, but it requires that the moment you write your first line of registration, you remember to go edit another function. As long as it runs on good intentions, a leak is only a matter of time.",
+    "What this kernel does instead: every operation that leaves a trace — registering a service, hanging a listener, starting a timer, loading a child plugin — goes through one entry point. That entry point runs your action on the spot, keeps the cleanup function the action returned, and hands you a copy.",
+    "**There is no way to write a call that registers something without giving you back a receipt.**",
+    "But \"you clean up what you create\" stops being enough right here. In real code, registrations nest: one registration calls other registrations inside itself. If the inner and outer layers each file their own record, a full unload runs the same cleanup twice.",
+    "Its handling is to re-claim ownership: the receipt the inner layer produced is folded into the outer layer's list and deleted from the top-level list. Tear up the outer one and the inner one goes with it; on a full unload, the inner one doesn't run a second time. Release happens in reverse order — last built, first collected.",
+    "A labeled inner registration also hangs itself on the outer one's metadata tree, so every registration a plugin currently has alive can be printed out as one whole nested structure. \"Who leaked the listener\" now has a direct answer instead of a guess.",
+    "Async cleanup is the other pit: one cleanup is already running when another holder comes to tear up the same receipt. The common way to write this hands the second caller an empty value and lets them walk, so they believe the cleanup is done. What you get here is the still-running task itself, and both sides can wait for it to actually finish.",
+    "There's a harsher one. Once a plugin instance enters the \"unloading\" state, new registrations are rejected outright. Anything registered during cleanup would escape this unload's snapshot, and rather than let it quietly survive, it fails on the spot.",
+    "**The correctness of cleanup shouldn't rest on remembering. It should rest on there being nothing else you could have written.**"
+   ]
+  },
+  {
+   "heading": "Nobody has to arrange the load order",
+   "body": [
+    "Plugins depend on each other. A needs what B provides, B needs C, so C has to come up first. The standard answer is a topological sort: draw the dependencies as a graph, sort it once, load in that order.",
+    "The trouble is that the runtime plugin graph isn't static. A provider can be swapped out mid-flight, can go offline for a while, or can be registered without actually being ready yet. Re-sort the graph on every change and the code spirals fast.",
+    "What happens here is that the whole thing gets squashed into a string.",
+    "Every plugin declares which capabilities it needs. The loading instance takes the serial number of the current provider behind each of those names and joins them with colons, in declaration order. If any one name has no available implementation right now, the whole string is set to a single sentinel value.",
+    "Then the state machine only looks at whether that string changed.",
+    "- Sentinel to a real value: dependencies are complete, load.",
+    "- Real value to sentinel: a dependency dropped, unload.",
+    "- One real value to a different real value: some dependency changed providers — unload first, compare again as the unload wraps up, and if it isn't the sentinel, go straight back into loading.",
+    "- String unchanged: do nothing.",
+    "\"Wait until the dependencies are ready\" and \"restart when a dependency changes hands\" are two things that elsewhere need scheduling logic written for them. Here they're the natural result of one string comparison. And nobody has to arrange the load order either — it grows out of the dependency declarations on its own.",
+    "One detail is easy to skim past: once loading begins, the code yields the event loop once and, on return, checks whether the string is still the same one it just saw. That window exists so a queued unload can keep the plugin body from ever executing. Running startup logic for a state that has already gone invalid is pure waste, and it leaves behind more things to clean up.",
+    "**The real payoff of squashing a complex state into one comparable scalar isn't fewer lines. It's that the branch hardest to get right becomes the most ordinary branch there is.**"
+   ]
+  },
+  {
+   "heading": "The same line of code: right in tests, wrong in a plugin",
+   "body": [
+    "Start with a real crash.",
+    "A bridge plugin for an editor protocol: 178 unit tests green, 100% line coverage. The moment a real editor connected, the first request blew up, and the second one blew up again under a different name. The error said: you can't access this capability without declaring a dependency on it.",
+    "But that capability was deliberately left undeclared. Declaring it would leave the demo configuration — the one with no persistence — hanging forever, waiting on a backend that would never load. So the code read it as \"use it if it's there, skip it if it isn't.\"",
+    "The problem wasn't in the declaration. It was in how the read happened.",
+    "The handle a plugin holds isn't an ordinary object; reading a property off it triggers a resolution. The path is: start at the current loading instance and check whether the name is in its dependency list; if not, jump to the parent instance, and if not there either, keep climbing to the root. Four outcomes — found, return it; the name is in some level's dependency declaration but nothing is available right now, report \"context not active\"; reached the root with no hit, report \"dependency not declared\"; found along the way that a parent scope uses a different isolation symbol for this name, error again, because an isolation boundary doesn't let you through.",
+    "The point is that this path only walks toward ancestors. Never sideways.",
+    "And the persistence backend hung off a sibling branch. From this path, ready or not, it is permanently invisible.",
+    "So why were all the tests green? Because the tests called it directly, outside of any plugin. In that situation there is no current loading instance at all, so resolution takes an early-return shortcut and queries the global table directly — where of course it finds it.",
+    "Which means the same line of code takes one path in a test and a different one inside a real plugin, and nothing about how it's written shows the difference.",
+    "The correct read is the other one: the flat read, which ignores the tree. It takes the current scope's isolation symbol for the name and looks it up in the global table directly, with no regard for how the loading-instance tree happens to be shaped. It's strict by default, too — if the provider isn't active you get nothing back, rather than a backend mid-teardown placed in your hands. The fix was to turn that one property read into a flat read.",
+    "**What's worth remembering from this incident isn't that line of code. It's that coverage proves the code was executed; it doesn't prove it was executed the way it will be once shipped.**"
+   ]
+  },
+  {
+   "heading": "A single call actually carries two identities",
+   "body": [
+    "One question is especially nasty in a plugin system: resources a service allocates on a caller's behalf — whose death should they follow?",
+    "Plugin A calls a method on service B, and inside that method a listener gets hung. When A unloads, that listener should disappear — it was hung for A. But the code lives in B, and B is still alive.",
+    "The usual answer is to have B maintain its own table of \"who called me and what I allocated for them,\" and have A notify it on unload. That takes cooperation on both sides, and every service has to write it again.",
+    "What happens here is a bit of tampering at the moment of handoff.",
+    "When a service instance crosses a plugin boundary into someone else's hands, it gets wrapped in a proxy. The first thing that proxy does: the context a method sees inside itself is the caller's, not the service's own. So anything registered inside B's method is billed to A, and disappears the moment A unloads.",
+    "But doing only that immediately creates a new problem: if B's method reads some other capability, it resolves against A's dependency declarations — and A has no idea what B needs.",
+    "So the proxy wraps function members in one more layer. On call, the receiver is swapped for a shadow object whose context is a child scope of the caller's, but which carries a mark pointing back at the service's own definition site. The upward walk described earlier starts from that mark first.",
+    "**Reads bind to the service's own location. Writes bind to the caller.**",
+    "That's exactly the mechanism behind the crash in the last section: an opportunistic read got bound back to the service's definition site by the shadow mark, and the thing it was looking for was on a sibling branch.",
+    "The shadow mark doesn't spread forever. When a shadowed context is handed down one more level, the mark is stripped — side effects produced by the next service down should be billed to its immediate caller, not to the original source. The one exception is a service that explicitly declares it keeps the shadow. Logging is exactly that: it has to know precisely who the caller is in order to write that plugin's name into the log prefix. That exception is called out by name in a comment in the code. It isn't an accident.",
+    "**A cross-plugin call actually carries two identities: one decides what it can see, the other decides who owns what it leaves behind. Merge them into one and you're wrong, whichever side you merge toward.**"
+   ]
+  },
+  {
+   "heading": "The kernel gave away its own critical path too",
+   "body": [
+    "For a framework to support hot reload, config interpretation, access auditing and the like, there are usually only two roads. Either you write them into the kernel, or you leave a few hook points and extensions can only attach to a whitelist.",
+    "This one took a third: the kernel's own critical path is itself an event chain.",
+    "Reading a capability, writing a capability, parsing plugin config, applying a config update — every one of these is an around-style middleware event. A listener gets the arguments and a hand-off function; call it and control passes to the next link; don't call it and everything after is vetoed, including the kernel's own default behavior.",
+    "So hot reload isn't part of the kernel — it's one link hanging on those chains. Same for the expressions in config that need evaluating. Same for auditing who read which capability, and when.",
+    "One level further down: the act of registering a listener can itself be intercepted. Before registration, a short-circuiting event runs first, and whoever returns a non-empty value replaces the default registration. That's exactly how config-update events get re-hung onto a hook chain private to the loading instance.",
+    "**What can be replaced isn't only a plugin's behavior. It's also how a plugin registers behavior in the first place.**",
+    "There are four ways events get dispatched, differing only in how they treat return values and async: one calls everyone synchronously, ignoring returns and waiting for nothing; one runs them all concurrently and aggregates the failures into a single thrown error; one awaits them in order, stopping at the first meaningful return value and handing it back; and one is the synchronous version of that.",
+    "The around-style implementation has a detail worth knowing. It doesn't nest the tail of the chain into closures layer by layer — everyone shares one cursor: there's a single listener array, the hand-off function is the same closure every time, and each call pops one off the front of the array.",
+    "Two consequences, and both run against intuition. Call the hand-off twice inside one listener and the second call gets \"the one after that,\" not a re-run of the tail. Capture the hand-off and call it later, after an await, and the chain's position may already have been advanced by someone else. Both are type-legal, and no error message will warn you.",
+    "**A framework's real extensibility isn't measured by how many hooks it opened. It's measured by whether it put its own default behavior on the same replaceable chain.**"
+   ]
+  },
+  {
+   "heading": "Same name doesn't overwrite; isolation doesn't leak through",
+   "body": [
+    "One capability name, two completely different implementations coexisting in the same process — the requirement sounds awkward, but you will hit it the moment you do multi-tenancy, sandboxing, or \"the same set of plugins running two configurations.\"",
+    "The usual answers are a namespace prefix, or just letting the later registration overwrite the earlier one. The first pushes the conflict onto a naming convention; the second turns it into a silent difference in behavior, and when something goes wrong you don't even know where to start looking.",
+    "What happens here: the key in the capability table isn't a name string at all. It's a symbol. The root scope mints one the first time it sees a given name, and every scope after that inherits the same one by default.",
+    "Isolating a name means giving it a fresh symbol in a child scope. Reads and writes for that name under that branch then land in a different slot, so a completely different implementation can coexist there, and the parent scope never notices. Pass the same label to two isolation calls and the two branches merge into one scope.",
+    "Registering the same name twice isn't an overwrite, and isn't a silent merge. It throws, and the error names the plugin the first registrant lives in.",
+    "The order of unregistration is deliberate too: delete from the global table first, then notify every affected loading instance and wait for them to settle, and only then remove it from your own dependency snapshot. That order guarantees dependents can still read it while they're tearing down, instead of getting half an object partway through.",
+    "There's an orthogonal axis: you can attach a piece of config to a capability that only takes effect under one branch. The merge order comes out of the prototype chain — closer to the root applies first, closer to the leaf wins. If the capability ships its own validator, the validator's merge rules apply; otherwise it degrades to a shallow merge.",
+    "**The whole design leans one consistent way: it doesn't try to adjudicate conflicts correctly when they happen. It removes the channel through which they could happen at all.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "The receipt is in your hand the moment you register",
+   "how": "The usual answer is to give the plugin an unload hook and have the author write every registration down a second time, with the pairing left to memory. Here, every operation that leaves a trace — registering a service, hanging a listener, starting a timer, loading a child plugin — goes through one entry point: it runs the action on the spot, keeps the cleanup function the action returned, and hands the caller a copy. A registration triggered further inside has its receipt folded into the outer list and deleted from the top-level one, so ownership is re-claimed: tearing up the outer one tears up the inner one, and a full unload won't run either twice. Release runs in reverse — what was built last is collected first.",
+   "why": "It makes \"resource created but cleanup never filed\" unwritable, and closes off double release at the same time."
+  },
+  {
+   "name": "Two holders can wait on the same async cleanup",
+   "how": "In the common way of writing this, a second holder who tears up the same receipt while a cleanup is already running gets an empty value and walks away believing the cleanup finished. Here every receipt registers a getter in a weak table that returns the cleanup currently in flight, so the second caller gets that still-running task itself and both sides can wait for it to actually end; the receipt exposed publicly is still one-shot and keeps the first result. Separately, once a plugin instance enters the unloading state, new registrations are rejected outright, so nothing registered during cleanup escapes this unload's snapshot.",
+   "why": "Re-entering an async teardown is the easiest class of race to miss; here it becomes a single task that both callers can converge on."
+  },
+  {
+   "name": "Dependency state squashed into a string of numbers",
+   "how": "The usual answer is to maintain a dependency graph and topologically sort it, re-sorting every time a provider changes. Here the serial number of each declared dependency's current provider is joined in declaration order into one string, and if any is absent the whole string becomes a sentinel. Sentinel to real value loads; real value to sentinel unloads; one real value to another unloads first, compares again as the unload wraps up, and reloads automatically; unchanged means nothing moves at all. Once loading begins, the code yields the event loop once and rechecks the string, so a queued unload can cancel a startup that hasn't run yet.",
+   "why": "Squashing \"is it ready, did it change hands\" into one string comparison lets load order emerge from the declarations themselves — no scheduler and no topological sorter."
+  },
+  {
+   "name": "Resolution that only walks up, and a bypass that ignores the tree",
+   "how": "A conventional container is one global table where anyone can find anyone. Here, reading a capability name walks up from the current loading instance through each level's dependency snapshot: a hit returns; the name is in the declarations but has no implementation right now, report context not active; reached the root with no hit, report dependency not declared; found that a parent scope uses a different isolation symbol for the name, error immediately instead of passing through. The whole path climbs the parent chain only — never sideways, never down. Alongside it lives a second read that ignores the tree entirely, looking up the global table by the current scope's isolation symbol, and returning nothing by default when the provider isn't active.",
+   "why": "Declared dependencies need \"you can't see what you didn't declare\"; opportunistic dependencies need \"you can see things on sibling branches too.\" Two requirements that only two separate reads can carry."
+  },
+  {
+   "name": "A cross-plugin call borrows the caller's identity",
+   "how": "The usual answer is for the service to maintain its own table of what it allocated for whom and wait for the caller to notify it on unload — code on both sides. Here a service instance handed across a boundary is wrapped in a proxy: the context read inside its methods is the caller's, so whatever gets registered belongs to the caller and disappears when the caller unloads. Function members get one more wrapper; on call the receiver is swapped for a shadow object whose context carries a mark pointing back at the service's definition site, and capability resolution starts from that mark first. Handed down one more level, the shadow mark is stripped; the only exception is a service that explicitly declares it keeps it.",
+   "why": "Reads have to resolve against the service's own dependency declarations, writes have to be cleaned up as the caller's. The two identities must be bound separately."
+  },
+  {
+   "name": "The middleware chain shares one cursor",
+   "how": "The usual implementation nests the tail of the chain into closures layer by layer, so every link gets a different hand-off function. Here there's a single listener array, the hand-off is the same closure every time, and each call pops one off the front and runs it; popping it empty falls through to the innermost layer. Not calling it vetoes the whole chain, including the kernel's own default behavior. The cost is semantics that run against intuition: calling twice in one link gets the one after that instead of re-running the tail, and a hand-off captured and called after an await may find the position already advanced by someone else.",
+   "why": "The gain is zero closure nesting during dispatch and a chain that can be intercepted and replaced end to end; the cost is that two perfectly legal ways of writing it both produce results nobody expects, and the type signatures don't stop either."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Opportunistic dependencies need the read that ignores topology; only declared dependencies have earned plain property access.",
+   "why": "Plain property access resolves up the loading instance's parent chain, and on a cross-service call the starting point gets bound back to the service's own definition site by the shadow mark, so anything a sibling branch provides is permanently invisible from that path. Worse, the error says \"dependency not declared,\" which sends you off investigating the declaration when the real problem is how you accessed it."
+  },
+  {
+   "lesson": "Have every registration return an undo handle on the spot, and let an outer layer take ownership of an inner one.",
+   "why": "If cleanup depends on authors pairing things up from memory, a leak is only a matter of time; returning a handle turns the pairing into something the syntax enforces. Nested re-claiming then guarantees that neither \"tear up the outer one\" nor \"unload everything\" runs the same cleanup twice, and that no layer gets skipped."
+  },
+  {
+   "lesson": "Squash dependency readiness into one comparable scalar and the load order emerges on its own.",
+   "why": "Any change to that string means the dependency set or a provider changed hands, so the state machine only has to compare before and after to decide load, unload, or unload-then-load. No topological sorter, no author hand-ordering plugins — and \"provider replaced,\" the case hardest to get right, turns into the most ordinary branch of all."
+  },
+  {
+   "lesson": "Keep at least one test that goes through the product's real loading entry point instead of assembling the plugin object by hand.",
+   "why": "Hand-mounting fills the dependency declarations in correctly for you and skips the loader's normalization of module exports; laying things flat on the root scope also degrades resolution into a direct global-table lookup. That is exactly how two real defects escaped together under 100% line coverage — coverage proves the code was executed, not that it works the way it ships."
+  },
+  {
+   "lesson": "In a shared-cursor middleware chain, hand off exactly once, and never after an await.",
+   "why": "The implementation pops the next link off the front of a shared array rather than nesting the tail into closures. So a second call gets the link after that, and a delayed async call may find the position already advanced by someone else. Semantically it's closer to passing a one-time token than to re-entrant function composition."
+  }
+ ],
+ "tradeoffs": [
+  "Almost every object that crosses a boundary has been wrapped in a proxy, so what you see while debugging isn't the original object; stack traces are only readable because the kernel splices the outer call frames back in itself, and that splicing logic is more code to maintain for the long haul.",
+  "Property access is sensitive to where the loading instance sits, and nothing about how it's written shows that: the same line runs fine in a top-level test and throws inside a real plugin, and the only difference is whether there is a loading instance right now. This has already caused one production crash, and I don't think it's a problem documentation can solve.",
+  "The shared cursor in around-style middleware makes both \"hand off twice\" and \"hand off after an await\" produce results that run against intuition, and neither the type signatures nor the error messages stop either one. The closure nesting you save is paid for with a class of trap you can only learn to avoid by experience.",
+  "Dependency recomputation is a full scan: any capability change walks every loading instance of every plugin in the registry. Event dispatch is likewise a linear pass over the listeners with a filter predicate called on each one. None of it matters at small plugin counts, but this is cost that grows linearly with scale — it isn't a subscription index.",
+  "Config validation can only run synchronously; a validator that returns an unfinished task gets a flat \"async validation not supported.\" Config that has to fetch data asynchronously before it can be validated must find another way.",
+  "This is an inlined snapshot of upstream source, pinned to a release candidate, with 18 local modifications accumulated so far — one of them specifically hardening lifecycle re-entry. Every upstream sync means re-applying or retiring those modifications. It trades long-term maintenance cost for complete control over the kernel's behavior."
+ ],
+ "codeIndex": [
+  {
+   "path": "vendor/cordis/src/reflect.ts",
+   "note": "Context proxy traps, fiber walking, the service table and notify-driven recomputation"
+  },
+  {
+   "path": "vendor/cordis/src/fiber.ts",
+   "note": "Plugin lifecycle state machine, effects and receipts, the dependency epoch string"
+  },
+  {
+   "path": "vendor/cordis/src/utils.ts",
+   "note": "Tracing proxy, shadow methods, the shared symbol table and stack splicing"
+  },
+  {
+   "path": "vendor/cordis/src/events.ts",
+   "note": "The four dispatch modes, the waterfall's shared cursor, listener filtering"
+  },
+  {
+   "path": "vendor/cordis/src/registry.ts",
+   "note": "Plugin form normalization, runtime records, dependency declaration parsing"
+  },
+  {
+   "path": "vendor/cordis/src/context.ts",
+   "note": "The three child-context constructions: extend / isolate / intercept"
+  },
+  {
+   "path": "vendor/cordis/src/service.ts",
+   "note": "The Service base class: construction is registration, scope filtering, config merging"
+  },
+  {
+   "path": "docs/postmortem/0001-acp-default-export-drops-inject.md",
+   "note": "Postmortem of a real crash caused by the difference between property read and flat read (178 tests green, 100% line coverage)"
+  }
+ ],
+ "related": [
+  "cordis-loader",
+  "agent-loop",
+  "self-modification"
+ ]
+}

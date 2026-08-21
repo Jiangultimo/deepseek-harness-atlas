@@ -1,0 +1,210 @@
+{
+ "id": "cordis-loader",
+ "lede": "In most systems, config is a startup argument: read once when the process comes up, dead data from then on. Want to change it? Restart.\n\nThat default is expensive inside an agent runtime that stays up for a long time — halfway through a session, you're not going to kill the whole process just to swap out one tool implementation.\n\nSo \"config you can edit while it's running\" sounds like a convenience feature. Actually building it, the trouble comes in a chain: change one line — what exactly should restart? Can config contain conditionals, and if so, when do they evaluate? Five or six sources of config stacked on top of each other — which one wins? It fails halfway through — where does the world stop?\n\n**Once config can be rewritten at runtime, it stops being an argument and becomes state: state that needs transactions, needs rollback, needs to be written back to disk. Every unusual design decision in this area is a consequence of that one sentence.**",
+ "packages": [
+  "vendor/loader",
+  "vendor/include",
+  "vendor/hmr",
+  "vendor/cordis",
+  "packages/boot/app-boot",
+  "packages/bundle/base"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "How a list becomes a living tree",
+   "body": [
+    "A config file is usually just a list: an array, each item a plugin plus some parameters. The loader reads it, mounts them one by one, done.",
+    "The problem with that only shows up the second time. The list changed, and you have nothing in hand that tells you which item changed. Is the third item of the old array the same thing as the third item of the new one? Nobody knows. So the answer in almost every implementation has to be: tear it all down and start over.",
+    "The first step here is to promote the list into a tree, then give every node on that tree an identity.",
+    "Three levels. Outermost is the tree, one per config source — usually a single YAML file — responsible for turning strings into real modules and for writing changes back to the file. In the middle is the group, the runtime owner of a list of rows: it takes a new list and turns it into the current state. Innermost is the row, one row per plugin instance.",
+    "A row can be marked as a container, and then its own config block is itself a list of rows — so the tree is recursive.",
+    "Identity is the crux. Every row has an id; if the file doesn't have one, a random eight-character hex string is generated and written straight back to the file. Rows inside a nested subtree join the parent's id with a colon. That gives every row a globally addressable name, so a single change can point at exactly one of them.",
+    "\"Startup finished\" has a precise definition here too: collect the import tasks and plugin lifecycle tasks of every row on the tree, wait on them over and over until a round goes by with no new tasks produced, then aggregate the per-row failures into one error and throw it once. So a failed startup reports every broken row at once, instead of stopping at the first one it hits.",
+    "There's a trap buried in the module import step. Once the module is in hand, it unconditionally peels off one layer of default export. A plugin that provides its entry point and config schema through named exports loses all of them the moment somebody adds a default export: the row's plugin identity is replaced by that value, and the named exports become invisible. And you can't fix this behavior in isolation — hot reload goes through the same module-fetching path, and the identity decision has to match on both sides.",
+    "**Promoting a line of config into an object with an identity and a lifecycle is the precondition for every \"restart just this one row\" that follows. Without identity, the word granularity hasn't earned the right to be in the conversation.**"
+   ]
+  },
+  {
+   "heading": "What gets absorbed in place, and what has to be replaced",
+   "body": [
+    "With identity in place, the next question arrives immediately: a field on this row changed — what exactly needs restarting?",
+    "The usual approach is binary — do nothing, or redo everything. A more careful version carves out special cases for a few fields, but the special cases are scattered through conditionals, and when someone adds a new field nobody answers \"which category is it in?\" head-on. So it inherits whatever path it happens to fall into, and then quietly drops state on one specific kind of change.",
+    "Here it's collapsed into one place. Merge the old and new fields into a candidate set (a null value means delete that key), sort them into a fixed order, and deep-compare key by key to get a list of differences. Empty list, return immediately — the file being rewritten with no change in content is the single most frequent event in hot reload.",
+    "Then the differences fan out into four paths:",
+    "- This row has no live instance right now (first mount, or it was switched off earlier): install the new config, import, start; on failure restore the old config and rethrow.",
+    "- The new config says off: unload the instance, but the row itself stays on the tree.",
+    "- The differences don't touch those three fields: patch in place. No re-import, the plugin identity is unchanged, only the prototype chain of this row's context is reset; if the config really did change, the instance restarts once carrying it. On failure, put the old config back and patch again to roll it back.",
+    "- The differences do touch those three fields: the instance has to be replaced. **Import the new module first, and only unload the old one once that succeeds**, then start the new one; if the new one fails to start, bring the old plugin object — still in hand — back up. That way a typo'd package name doesn't take out the thing that's currently running.",
+    "The three fields are the module name, the dependency declaration, and the container marker. The reasons differ, but all three are hard: the module name determines the plugin identity, so changing it means a different plugin; the dependency declaration is resolved into a dependency table at the instant the instance is created, and the framework uses that table to decide when an instance may activate — it can't be changed after the fact; the container marker decides whether this row is a container, which is a structural property, not a parameter.",
+    "Every other field takes the in-place path, including the two used for service isolation. When an isolation marker changes, the existing service implementation is moved off the old symbol onto the new one and only the affected contexts get notified — the provider is not restarted.",
+    "**Restart granularity isn't a performance optimization — it's the correctness boundary for this class of system.** Writing it down as an explicit set of three fields means every field added later has to answer \"can this be changed in place?\" head-on — which matters far more than the few hundred milliseconds saved."
+   ]
+  },
+  {
+   "heading": "The hard part isn't whether you can write it, it's when it evaluates",
+   "body": [
+    "Wanting conditionals in config is a natural ask: install this plugin only on Windows, take that parameter from another service at runtime.",
+    "There are two usual approaches. One is to invent your own template syntax, then be forced to keep bolting on features until it grows into a half-baked language. The other is to just allow host-language expressions and evaluate them while parsing the config.",
+    "The trouble with the second one isn't safety. It's timing. Config parsing happens before any plugin has started, and at that moment not one of the services you want to reference exists yet.",
+    "The answer here: the parse stage never evaluates anything. A custom tag turns an expression into a node carrying its original text, left in the data as-is. Evaluation is deferred — and deferred to two completely different moments.",
+    "The config block is evaluated lazily. The plugin instance holds on to the untouched raw config the whole time; only when it's actually about to activate does a global hook run, recursively replacing expression nodes with values and handing the result to schema validation.",
+    "And whether an instance can activate depends on whether every service listed in its dependency declaration is already there. If one isn't, the instance stays inactive and never reaches the evaluation step at all.",
+    "So \"declare that I need a service\" plus \"read a field off that service in my config\" holds together — whatever the expression reads is guaranteed to already be in place.",
+    "The on/off field takes the exact opposite path: evaluate immediately. Every time the question \"should this row run?\" is asked, it's computed on the spot against that row's context, and the parent chain is walked upward — if any ancestor is switched off, every descendant goes with it. It has to work this way, because install-or-not is decided before the instance exists, and it can't wait for dependencies to be ready. The original node always stays in the data, so what gets written back to the file is still the expression, not the value it evaluated to.",
+    "One exception has to exist. The config block of a container plugin is nothing but somebody else's list of rows. Evaluate the expressions inside it at the container level and they run once, in the wrong context, at the wrong time. So those two kinds of plugin carry a marker; when the evaluation hook sees it, it waves the whole block through, letting each expression travel down with the row it belongs to.",
+    "Evaluation works by spreading the entire runtime context into the scope chain and then just executing the text. So config can name services directly, and the host can stuff helper functions into the context — a function that resolves a home-directory path, say, callable straight from config. The price for that comes later.",
+    "**Once config can contain expressions, the syntax barely matters. Timing is the whole thing. Inside one file, two kinds of field need exactly opposite timing: one must wait until dependencies are ready, the other must land before the instance exists. Draw that line wrong and what you get isn't an error message. It's startup-order voodoo.**"
+   ]
+  },
+  {
+   "heading": "Layering only exists at the moment of assembly",
+   "body": [
+    "A shipped application doesn't ask its users to edit one several-hundred-line config file.",
+    "The real thing is stacked out of several places: an empty root list, plus a layer of rewrites shipped with each feature package, plus a layer from whichever preset was selected, plus a layer from the user's home directory, plus overrides passed on the command line.",
+    "The usual approach makes those layers a runtime concept — layers have priority, and looking up a value means walking down through them. The cost is that the runtime carries that hierarchy forever, and \"what's actually in effect\" always has to be computed on the spot.",
+    "Here it's the reverse: the layers are flattened into a single patch list at assembly time and handed to one file backend in one go. Layering exists only during assembly; at runtime there's a single application of it.",
+    "There are two kinds of patch. The insert kind appends a new row: give it an id and the row goes into that container row's child list, and if the target isn't a container it warns and skips; give it no id and the row lands at the top level. The other kind requires an id, finds that row, and overwrites the patch's remaining keys onto it; if the patch also names a module, that name has to match the target row's before anything happens — a check against an id being reused and the wrong row being edited.",
+    "There's one detail in the algorithm that's easy to miss and lethal to get wrong: an inserted row is added to the index immediately.",
+    "Because this list was flattened out of many layers, a later layer has to be able to configure — or switch off — a row a previous layer just inserted. The upstream implementation builds the index once before the loop starts, so an inserted row can never be hit by a later patch inside the same list. That's one of the things changed here.",
+    "Another detail is purity: the algorithm deep-copies the entire input first, and returns a detached copy even when the patch list is empty. The file backend caches its parse result; if a patch mutated that cache in place, then on the next hot reload \"remove one patch\" could never get back to the state without it — the mutated value is already burned into the cache.",
+    "Overrides replace whole keys; there's no deep merge. If a patch carries a config block, the target row's entire config block is replaced by that object. A patch pointing at an id that doesn't exist logs one warning and is skipped — it won't fail startup.",
+    "The same function is reused by the offline config-printing command. It parses the base file, runs once per layer prefix, and uses positional comparison to work out which rows came from which layer and which layers modified them, then prints in the same dialect, expressions preserved verbatim and never evaluated.",
+    "**Reuse instead of reimplement, because the moment a debugging tool writes its own copy of the merge logic, it diverges from real mounting on the corner cases — and when they diverge, people trust the printed version more.**"
+   ]
+  },
+  {
+   "heading": "An update is run as a transaction",
+   "body": [
+    "Turning a new list of rows into the current state can fail partway through. The plugin on row seven throws, and the six rows before it are already mounted. Where does the world stop?",
+    "The usual approach is to stop where it is, log a line, and keep going. What you get is a tree that's half new and half old — it runs, but nobody can say what state it's in.",
+    "Here it's a transaction. Check for duplicate ids first, then create all the new rows concurrently and wait on every result. If any failed, remove the rows added in this pass in reverse order and re-create the old ones; if recovery fails too, throw the original error and the rollback error together. Only when everything succeeded are the old rows missing from the new list removed and the new data committed.",
+    "There's one more deliberate check: if the whole tree was unloaded while the wait was in progress, return immediately. At that point a sibling row's failure isn't describing an update that needs rolling back — it's describing a world that no longer exists.",
+    "The transaction isn't reentrant, and three paths trigger it: the first application, the re-read after a file change, and a patch-list update. So the file backend threads all three through one queue, and the content comparison happens inside the queue too — \"did anything change?\" is asked against the state left by the previous task's commit, not against a snapshot taken mid-flight. A failure in the previous task doesn't block the next one; that failure belongs to its own caller and shouldn't spread.",
+    "The consequence of not doing this is ugly: two concurrent applications interleave creates and rollbacks over the same batch of rows and wedge the whole backend in a state that never settles. No stack, no log, just a hung process.",
+    "Writing back is the other half of two-way. When a plugin changes its own config while running, a hook fires ahead of the update and, once the update completes, writes the new config — possibly already normalized by the schema — back onto that row and triggers a disk write.",
+    "Self-unloading is the stranger one. The loader listens to plugin registration events and uses seven conditions to separate \"the plugin unloaded itself\" from \"its parent unloaded it,\" \"hot reload replaced it,\" and \"the whole tree is coming down\" — and then writes an off marker into the config file.",
+    "**Which is to say: a plugin deciding to quit turns into a line of persistent state in the config file.** Next startup it isn't there, and nobody has to remember that it happened.",
+    "The disk write itself is hardened: write a temp file first, then rename; if the rename hits a permission or in-use error, retry up to ten times with increasing backoff. Write requests are debounced and serialized. A terminal failure stays on the queue so the backend rethrows it when it shuts down, rather than quietly claiming the write finished. None of this is a taste for defensive programming — it's real lost state, caused by something on Windows briefly holding a handle on the target file.",
+    "**A piece of config the runtime can rewrite and that has to be written back to disk is no different in kind from a row in a database. Everything you'd bring to a database — transactions, rollback, serialization, durability confirmation — it needs every one of them too.**"
+   ]
+  },
+  {
+   "heading": "The hard part of reloading is knowing what to reload",
+   "body": [
+    "The easiest way to get hot reload wrong is to read it as \"the file changed, so start over.\"",
+    "Starting over is of course always correct, at the cost of losing all runtime state for every single character you type. The hard part is the judgment call: who does this change actually reach?",
+    "The watcher sorts changes into three kinds. If the changed file is inside the dependency closure of the command-line entry point, that's the framework layer and the only option is restarting the whole process. If the changed file happens to be the config file of a mounted file backend, only that subtree re-reads, and the new list it reads goes through the transactional comparison above — rows that didn't change are untouched. Everything else is an ordinary module and goes into partial reload.",
+    "Partial reload starts with a reachability pass: external dependencies seed the \"reject\" set, changed files seed the \"accept\" set, and both propagate along module dependency relationships. Then it walks the plugin module of every row on the tree and computes its dependency closure; only a row whose closure contains an accepted file gets restarted.",
+    "Two details in the restart itself are worth pulling out.",
+    "First, there are two caches to clear. Files in the accept set have to be deleted from the ESM module cache and the CommonJS cache both — since Node 24 the same module can live in either, and clearing only one gets you the old code.",
+    "Second, remounting has to use the raw config, not the evaluated one. This falls out of the lazy-evaluation design: remount from an evaluated result and the expression was computed exactly once, at first mount, and stays that snapshot forever after. If any step fails, both caches are restored and the old plugin goes back in.",
+    "There's one deliberate asymmetry in the watchers. The main watcher ignores the initial scan, because that scan re-announces the files startup just read, and the announcement for one of the config files would trigger a re-read while the first application is still running; a failed first application then rolls back the watcher itself, and its teardown waits on that re-read sitting behind it in the same queue — a deadlock with no diagnostic information at all.",
+    "The kind of watcher that tracks a single user patch file, though, keeps the initial scan: a patch layer that already exists at registration time has to be applied once.",
+    "**The same mechanism configured in opposite ways at two sites is usually a sign something is wrong. But there are exceptions — when \"initial\" means two entirely different things in the two places, it's symmetry that's the mistake. Places like this have to be written down, or the next person will helpfully \"fix\" it back.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Every row is a thing with an identity",
+   "how": "The usual approach treats config as an array: read it, mount each item, and when the list changes there's nothing to do but start over — because nothing in an array identifies which item changed. Here the list is promoted into three levels: the tree corresponds to one config source and handles module imports and writing back to the file; the group is the runtime owner of a list of rows, turning a new list into the current state transactionally; the row is the smallest unit, holding one set of options and one plugin instance. A row can be marked a container, in which case its config block is itself a list of rows, which makes the structure recursive. Every row has an id; if the file doesn't have one, a random eight-character hex string is generated and written back immediately, and a nested row's id joins the parent's with a colon, forming a globally addressable name.",
+   "why": "No identity, no granularity — \"restart just this one row\" only means something once \"one row\" is an object you can point at."
+  },
+  {
+   "name": "Four update paths, and only three fields force a replacement",
+   "how": "The usual approach is binary: nothing happens, or everything is redone; a more careful version carves out special cases for a few fields, but those cases are scattered through conditionals. Here the old and new fields are first merged into a candidate set, sorted, and deep-compared key by key into a list of differences, which then fans out into four paths: an empty list returns immediately; no live instance means import and start; a new state of off means unload; if the differences don't touch the module name, the dependency declaration, or the container marker, the row is patched in place — no re-import, just a reset of the context prototype and a restart of the instance carrying the new config; otherwise the new module is imported first, the old instance is unloaded only after that succeeds, and the new one is started last.",
+   "why": "Importing before unloading means a typo'd package name doesn't take out the running thing first; and everything outside those three fields can be absorbed in place because only those three are frozen at the instant the instance is created."
+  },
+  {
+   "name": "Two fields accept expressions, on exactly opposite timing",
+   "how": "The usual approach evaluates while parsing the config, but at that point no service exists yet. Here the parse stage only turns an expression into a node carrying its original text. The config block is evaluated lazily: the instance holds the raw config until it's about to activate, at which point the nodes are recursively replaced and the result handed to schema validation — and whether it can activate depends on whether the services in its dependency declaration are all present, so whatever an expression reads is guaranteed to be in place. The on/off field is evaluated immediately: computed on the spot every time the run-or-not question is asked, walking up the parent chain, and any ancestor switched off takes all its descendants with it. The original node is always kept, so writing back to the file never replaces it with the evaluated value.",
+   "why": "Install-or-not has to be decided before the instance exists, so it can't wait for dependencies; an expression that references a service can't be computed until that service is there. Opposite timing means they can't share one path."
+  },
+  {
+   "name": "A container's config is waved through untouched",
+   "how": "The evaluation hook is global and would, by default, recurse into every row's config block. But for the group and file-backend kinds of plugin, the config block is nothing but somebody else's list of rows or list of patches; evaluating at the container level would run those expressions once, early, in the wrong context at the wrong time. So those two kinds carry a marker, and when the hook sees it the whole block goes through with no recursive replacement, letting each expression travel down with the row it belongs to. The side effect is that these two kinds of plugin keep their own fields — a file path, for instance — literal as well.",
+   "why": "Any global recursive pass needs a \"don't recurse here\" exit, or a nested structure gets unfolded one level too early."
+  },
+  {
+   "name": "A later layer has to reach a row an earlier one inserted",
+   "how": "Patches are applied through an index keyed by id: the insert kind appends a new row, the rest find a target by id, optionally verify the module name, and overwrite the remaining keys wholesale. The usual way to write this is to build the index before the loop and then match each patch against it, which is fine with a single layer of patches. But the list here was flattened out of five or six layers, and a later layer has to be able to configure or switch off a row an earlier one just inserted; build the index once and an inserted row can never be hit inside the same list. So an inserted row is added to the index immediately. The algorithm also deep-copies the whole input first, returning a detached copy even when the patch list is empty.",
+   "why": "The file backend caches its parse result; if a patch mutated that cache in place, \"remove one patch and re-apply\" could never get back to the state without it, and hot reload would go from two-way to one-way."
+  },
+  {
+   "name": "An update is a transaction, and transactions don't run concurrently",
+   "how": "The usual approach on a mid-flight failure is to stop there and log a line. Here it checks for duplicate ids, then creates all the new rows concurrently and waits on every result; on any failure it removes the ones added in this pass in reverse order and rebuilds the old ones, and if recovery fails it throws the original error together with the rollback error; only on full success does it remove the old rows that disappeared and commit. If the whole tree was unloaded during the wait, it returns immediately and doesn't roll back. The method isn't reentrant, yet three paths trigger it, so the file backend threads all of them through one queue and does the content comparison inside the queue.",
+   "why": "Two concurrent updates interleave creates and rollbacks over the same batch of rows and wedge the backend in a state that never settles — no stack, no log, just a hung process."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Write down \"which changes require a rebuild\" as an explicit set of fields; don't let it scatter through conditionals.",
+   "why": "Restart granularity is the easiest thing to get wrong in a config system, and the failure mode is well hidden — it usually doesn't raise an error, it just quietly drops state on one particular change. Once it's collapsed into a single readable decision, every field added later has to answer \"can this be changed in place?\" head-on, instead of inheriting whatever path it happened to fall into."
+  },
+  {
+   "lesson": "Once config can contain expressions, when they evaluate matters far more than how they're written.",
+   "why": "An expression that references something at runtime requires evaluation to happen after that thing exists; a field that decides install-or-not has to be computed before the instance exists. Inside one file, two kinds of field need exactly opposite timing. Draw that line wrong and what you get isn't an error message. It's startup-order voodoo."
+  },
+  {
+   "lesson": "Let one algorithm serve both \"actually execute\" and \"print for a human to read.\"",
+   "why": "The moment a config-assembly debugging tool reimplements the merge logic, it diverges from real mounting on the corner cases — and when they diverge, people trust the printed version more. Reuse the same pure function and the printed result earns the right to count as evidence."
+  },
+  {
+   "lesson": "Thread non-reentrant operations through an explicit queue; don't bet on \"they won't happen at the same time.\"",
+   "why": "Three paths lead to the same update entry point here. Assume they never overlap and what you get isn't a crash — a crash would be decent — but something that never settles plus a teardown deadlock: no stack, no log, just an exit code."
+  },
+  {
+   "lesson": "Deep-copy a shared data structure before rewriting it, even when this pass rewrites nothing at all.",
+   "why": "Config gets re-applied over and over. If a rewrite mutates the cached parse result in place, then \"remove one rewrite and re-apply\" can never get back to the state without it, and hot reload goes from two-way to one-way. And the symptom shows up several operations later, which makes it nearly impossible to locate where it happened."
+  }
+ ],
+ "tradeoffs": [
+  "Config expressions have no sandbox: the entire runtime context is spread into the scope chain, and an expression can do anything the host process can do. Which means the config file is equivalent to executable code — whoever can write it can execute code. That's acceptable in a local dev tool; in a different deployment shape it's another matter.",
+  "Only the config block and the on/off field accept expressions; the module name, the id, and the dependency declaration must be literals. So \"swap the plugin by environment\" can only be expressed through the on/off field or a patch layer — you can't compute a package name from an expression. That's what the evaluation timing buys, but it does cost you a whole way of writing things.",
+  "Patch overrides replace whole keys with no deep merge. Changing one field inside a config block means rewriting the entire block. The more layers there are, the easier it gets for a later layer to accidentally wipe out a sibling field an earlier one set — and that never raises an error.",
+  "A patch pointing at an id that doesn't exist only logs a warning and won't fail startup: misspell an id and that layer's intent is silently lost. Patches also don't cross nesting lines — an outer patch can't locate a row inside a subtree brought in by another file backend, so the only option is editing that file directly.",
+  "Writing back regenerates the whole file: fields are reordered into a fixed sequence and comments are never preserved. But the config file doubles as documentation for humans — the example configs in the repo are heavily commented — and one runtime write-back erases all of it. Personally, this is the trade-off I'm least comfortable with right now.",
+  "Hot reload depends on Node's internal module loader, which you can only get at by exposing internals or going through a native addon, and the interface differs between Node 22/23 and Node 24, so the code carries two versions of it. Which means this layer is tied directly to how Node evolves: upstream moves, you move."
+ ],
+ "codeIndex": [
+  {
+   "path": "vendor/loader/src/config/entry.ts",
+   "note": "One row's lifecycle: the four-way difference decision, import, start, rollback"
+  },
+  {
+   "path": "vendor/loader/src/index.ts",
+   "note": "The loader itself: expression evaluation hook, write-back, self-unload detection, module export unwrapping"
+  },
+  {
+   "path": "vendor/loader/src/config/group.ts",
+   "note": "Transactional update of a group of rows, with reverse-order rollback"
+  },
+  {
+   "path": "vendor/loader/src/config/tree.ts",
+   "note": "Tree structure, id resolution, module import, waiting for startup to settle"
+  },
+  {
+   "path": "vendor/loader/src/config/isolate.ts",
+   "note": "Symbol realms for service isolation, and moving implementations between them"
+  },
+  {
+   "path": "vendor/include/src/index.ts",
+   "note": "The YAML file backend: patch algorithm, serial queue, hardened disk writes"
+  },
+  {
+   "path": "vendor/hmr/src/index.ts",
+   "note": "File watching, partial reload, precise config watching"
+  },
+  {
+   "path": "packages/boot/app-boot/src/index.ts",
+   "note": "How the host mounts the root file backend and flattens the patch layers"
+  }
+ ],
+ "related": [
+  "cordis-core",
+  "patch-stack",
+  "preset",
+  "self-modification"
+ ]
+}

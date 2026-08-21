@@ -1,0 +1,211 @@
+{
+ "id": "tools",
+ "lede": "Adding a tool to an agent sounds like the easiest thing in the world: write a function, return something.\n\nAll the trouble is in that second half — \"return something.\" The caller wants a machine value it can keep computing with. The model wants text it can read into context. The UI wants data that will still draw the same card tomorrow when this session is replayed. Three readers, three appetites, one return value.\n\nThe usual approach makes the author splice it together: return a string for the model, tuck a bit of structure into that string for the UI, drop the machine value on the floor. Follow that road far enough and the three outputs drift apart, the UI blows up when you replay an old session, and nobody can say which layer is at fault.\n\n**What's worth watching here isn't what a tool returns — it's what makes that one return value answerable to three directions at once.**",
+ "packages": [
+  "packages/core/tools",
+  "packages/interaction/user-approval"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "One Return Value, Three Readers to Serve",
+   "body": [
+    "\"What does a tool return\" looks like a question not worth asking. I think it decides everything that comes after.",
+    "One call has three downstreams at once. The caller wants a machine value it can keep computing with; the model wants text it can read into context; the UI wants data it can draw as a card — and draw the same card tomorrow when this session is replayed.",
+    "The usual approach smears all three into one return value: a string for the model, a bit of structure tucked inside that string, and the UI parses it back out. The end of that road is predictable — any format change in one place breaks the other two.",
+    "Here the tool body's output is narrowed down to a single plain data value. That value is checked against the format the tool declared up front, deep-frozen once it passes, then handed to two pure functions the same tool declares: one projects the text the model sees, the other projects the structured data the UI needs.",
+    "Three outputs, one source, completely different lifespans. The machine value deliberately never reaches the durable log — the model never sees it, and replaying an old session doesn't need it rebuilt. What stays in the log is the model text, the error category on failure, and that UI data.",
+    "The UI share splits again by moment: the pending card, drawn the instant the call goes out, can only depend on the arguments; the result card, drawn after it finishes, depends on arguments plus result.",
+    "Both have to be pure functions, because the UI calls them down two completely different paths — one rendering live as it streams, one replaying history out of the log. If either quietly reads current process state, the replayed card won't match what was on screen at the time.",
+    "**Put another way: what a tool is isn't determined by what it returns — it's determined by how three directions each take their share of that return value.**"
+   ]
+  },
+  {
+   "heading": "The Expensive Part of an Extension Point Isn't Getting In",
+   "body": [
+    "Making tool calls interceptable is something every agent system gets to sooner or later. Approval, timeouts, retries, rate limits, rewriting results — all of it wants to sit before or after the act of calling.",
+    "The usual approach is one before-hook and one after-hook: hang whatever you want off them. Two problems. There's no agreed order among the hooks, and one hook that throws can blow up the whole call.",
+    "Here a call is broken into five fixed segments. The first four are delegating chains — a listener can hand control to the next one, or reach a conclusion itself and short-circuit everything behind it:",
+    "- A reorderable front gate: allow, deny, or ask the user",
+    "- A guard that can only tighten",
+    "- An around-style dispatch wrapper: timeouts, retries, metrics",
+    "- A post-verdict: accept, replace, block, or append some context",
+    "- The tool's own one-shot content transform",
+    "Every segment is wrapped in a catch: anything thrown turns into a failed result on the spot and keeps moving down the line, rather than being flung back at the caller. At the end of the pipeline there's a read-only completion notice, and it goes further still — a listener that throws, or that hands back a rejected async result, gets one warning line in the log and nothing else; the conclusion already reached is never touched.",
+    "That last content transform has an uncommon property. It's snapshotted the moment the call begins, and it runs exactly once for every normalized result — including pipeline-level failures that never got anywhere near the post-verdict. A tool that wants to wrap all its output in one envelope therefore doesn't have to repeat itself on every failure path. The snapshot isn't fastidiousness either: while the arguments are being reduced to plain data, a malicious or careless getter gets a chance to swap out the callback that was already registered.",
+    "Stage order isn't held together by verbal agreement either. A companion checker plugin hangs off the framework's internal dispatch events and uses weak references to remember how far each execution has gotten: the front gate can't fire twice, dispatch has to follow the gate, the post-verdict has to follow the gate or dispatch, and the execution and result handed to the completion notice must both already be frozen.",
+    "**The expensive part of extensibility was never \"you can plug in\" — it's \"after you plug in, someone can still say what order things happened in.\"**"
+   ]
+  },
+  {
+   "heading": "It Doesn't Solve Ordering Conflicts — It Makes Them Unwritable",
+   "body": [
+    "The front gate is reorderable, and any listener can return \"allow\" outright. That's necessary when some plugin has to have the final word, but it drags in an obnoxious property: safety conclusions start depending on registration order.",
+    "Which raises a very ordinary question — the check I just added, can some later-loaded plugin flip it back to allow?",
+    "The usual answer: write it in the docs, lean on review, lean on regression tests. Honestly, not one of those three guarantees anything a month from now.",
+    "The answer here is different. After the gate there's a guard, its signature short enough to fit on one line: take a read-only call, return a reason for refusal, or return nothing.",
+    "The point is that the return type has no value for \"allow\" at all. A guard can refuse, or abstain.",
+    "Evaluation runs the global layer first, then walks the scope chain from far to near, and stops at the first one that states a reason. How many you hang on, in what order, whether a hot reload shuffles them — the conclusion doesn't change, because there is no way to write \"take back that earlier refusal\" in the language.",
+    "**It didn't solve the ordering conflict. It made the ordering conflict impossible to express.**",
+    "What that saves isn't one decision — it's a whole class of questions that would otherwise need arguing: is this plugin before or after that one, does reordering change anything, does adding one mean re-auditing all the existing ones. The answer is uniformly \"nothing changes.\"",
+    "The same conservative default gets reused elsewhere. The classifier that decides whether a call can run alongside its siblings counts it as parallelizable only on a strict \"yes\"; not declared, returned something else, threw — all of it counts as exclusive.",
+    "Or push it one step further: the default stands on the conservative side, not on the side of \"the config was written correctly.\""
+   ]
+  },
+  {
+   "heading": "No Question Gets a Second Answer",
+   "body": [
+    "\"Which tools can this agent see\" sounds like one table lookup. It's actually several layers stacked: what's registered globally, a same-name override registered by one agent, the allow and deny filters attached to that agent, and the extra execution tool that code mode splices in.",
+    "At least five places consume those layers: the prompt lists the tools; execution decides whether a call is legal; concurrency classification looks it up; generating the interface listing for the model looks it up; and the prompt's tool-ordering check looks it up too.",
+    "The usual approach writes it out at each site — the logic isn't long anyway. The cost is that the copies slowly diverge, with a very recognizable symptom: the model is told a tool exists but can't call it, or the reverse, it reaches a tool that was never declared to it.",
+    "Here it's implemented once. One function, one walk, three sets out of it: the visible definitions, the known names from before filtering, and the global names filtering may touch. The last two aren't freebies — the prompt's ordering check needs the pre-filter names, and the filter's own argument validation needs the filterable ones.",
+    "Filtering has a deliberate exemption: it applies only to the inherited part of the surface, never to what this scope registered itself.",
+    "That isn't laziness. The delegation runtime registers a subagent's reporting tool and structured-output tool into the child's own layer, and a filter that sets out to limit what the child can do must not strip away the mechanism the child answers with.",
+    "This exemption has been stepped on once, and the source comment still records it. It was originally read as \"the global layer\" — back when tools all hung off the host composition, the two readings were equivalent. Once presets moved tools onto the agent plane, those became contributions from an ancestor layer, and a subagent's filter quietly stopped constraining anything. The fix was to change the test from \"the global layer\" to \"not my own layer.\"",
+    "**A concept with two implementations will eventually have two meanings — and the symptom of that split usually shows up somewhere other than the place you edited.**"
+   ]
+  },
+  {
+   "heading": "A Call That's Certain to Fail Shouldn't Disturb Anyone",
+   "body": [
+    "In code mode the model is allowed to call exactly one thing directly — the tool that runs code. Any other name is guaranteed to fail.",
+    "How should a guaranteed failure be handled? The natural way is to let it run the policy pipeline like anything else and raise the error at the execution stage.",
+    "That goes wrong. The front gate fires, an approval prompt pops up, the audit records a line, and every policy listener does a round of work for something that cannot happen. The worst version: a user actually clicks approve on an operation that was going to be refused anyway.",
+    "So the call ends before it enters the policy pipeline. The predicate that decides this lives in exactly one place and is shared by three: which definition may execute, the early cutoff when the execution object is created, and the condition under which the prompt renders the line saying this is the only thing callable directly.",
+    "The rule the prompt states and the rule the executor enforces come from the same code, so they can't drift. I'm increasingly convinced this matters more than the interception itself — write the decision twice, once on each side, and any edit can leave the model reading a rule the system doesn't enforce, or getting refused by a rule never declared to it.",
+    "The refusal message is designed too: it carries a way out — only that one tool can be called directly, so call the tool you want from inside its program. A bare \"unknown tool\" leads the model to conclude that a tool the prompt just declared doesn't exist and the deployment is broken, instead of correcting how it calls.",
+    "A name that genuinely was never registered still takes the old path and reports an unknown tool at the dispatch stage — policy listeners should see every name that reaches the registry. One more detail: if the doomed call arrives with the cancellation signal already aborted, what comes back is an abort rather than an unknown tool. Cancellation semantics win.",
+    "**Every refusal you send a model is a piece of prompt. \"No\" and \"No — go this way instead\" produce completely different behavior on the next turn.**"
+   ]
+  },
+  {
+   "heading": "What You Give Up by Compressing Turns Into a Program",
+   "body": [
+    "The idea behind code mode is plain: instead of the model calling one tool per turn over several round trips, let it write a program and call the tools as functions inside it. The tool list collapses to one entry, and everything else becomes an auto-generated interface listing in the prompt.",
+    "That listing is sorted by name, so as long as the tool set doesn't change the generated text is byte-for-byte identical — which suits prompt caching.",
+    "Every tool call inside the program is a real nested execution, running the full five-segment pipeline, just carrying the outer call's token as a parent marker. The arguments are snapshotted twice, once for dispatch and once for the log — so even if the tool body mutates the argument object it received, the record in the log doesn't move with it.",
+    "Nested calls don't run concurrently on a whim. There's a single-lane scheduler built in: every stage with an ordering requirement is threaded through the one lane, and only the tool body itself leaves the lane to run in parallel, up to a configurable ceiling. An exclusive call waits for the pool to drain and runs alone, and its barrier holds until its own post-verdict has finished.",
+    "The logging arrangement is counterintuitive: each nested call records two events, both marked log-only and skipped when model messages are derived. The result is that nested calls land in persistence and in the UI in full, but never in the model's context — the model only sees what the program printed and returned.",
+    "That's worth a pause. There's a hard rule in this repo: anything the model can see must be reconstructable from the log. Nested calls show that the converse doesn't have to hold. The log is perfectly free to know more than the model's context does.",
+    "The cost is clear enough: the UI projection is computed only for top-level calls, so nested calls inside a program have no such data. The same tool that renders as a structured card in native mode falls back to raw result text in code mode.",
+    "**Compressing many turns into one program saves you the turns and gives up visibility into each step.**"
+   ]
+  },
+  {
+   "heading": "A Capability Can Be Absent; the Conclusion Can't Be Vague",
+   "body": [
+    "The front gate's third conclusion is \"ask the user.\" That has a deployment-level problem: not every deployment has a human in it. Batch automation, headless mode, plain API calls — none of them has anyone to show a prompt to.",
+    "The usual approach makes approval a hard dependency: without it the whole system won't start. That forces unattended deployments to install a fake approval implementation, and then everyone pretends it's real.",
+    "Here approval is optional: the registry looks it up in a way that tolerates absence, and if nothing is there, \"ask the user\" degrades to a refusal while everything else keeps working. A call with no agent is refused too — there's no session to audit and no UI to route to.",
+    "There are four outcomes; exactly one of them is permission, and it's good for one use. The four map to four distinct refusal reasons, so the model can tell \"a person said no\" apart from \"there is no approval channel at all.\" The right next move differs: the first calls for a different plan, the second calls for saying plainly what's missing.",
+    "The \"never ask\" policy is decided inside the service's own request path rather than as a listener. The comment says why bluntly: a listener registered to go first can sit ahead of any gate that is itself a listener, so a listener cannot promise \"refuse every time, regardless of registration order.\" Only the service's own path can.",
+    "Same idea as the guard: put what must not be bypassed outside the extension point.",
+    "Auditing comes in pairs: one question, one recorded outcome, exactly one pair, and it has to sit inside an open turn. A turn is the durable log's commit and replay boundary; a bare event between turns can't be told apart from crash residue on reload, so it gets dropped.",
+    "Everything else collapses to the conservative answer: a responder that throws, a return value outside the vocabulary, the default when nobody answers — all of it counts as \"unavailable\"; an aborted signal counts as \"cancelled\"; a late answer is simply thrown away.",
+    "**A capability can be absent; the conclusion can't be vague — absent, errored, or cancelled, the default answer has to be no.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "One Value, Three Directions Each Take a Share",
+   "how": "The usual way has a tool return a string for the model, tuck some metadata into it for the UI, and discard the machine value once it's been computed. Here it's inverted: the tool body may hand back only a plain data value, checked against the format declared up front, then deep-frozen, then projected into model text and UI data by two pure functions the tool itself declares. A projection that throws counts as invalid output; the projected result then has to survive a lossless snapshot, and failing that counts as a failure too. Three outputs from one source, with different lifespans: the machine value lives only inside this execution, the model text goes into the conversation, the UI data goes into the durable log.",
+   "why": "One value, three consumers, each taking what it needs, none holding the others hostage."
+  },
+  {
+   "name": "The Guard Can Say No and Cannot Say Yes",
+   "how": "An ordinary hook can both refuse and allow, so \"can a later-loaded plugin flip my check back to allow\" is forever a question that needs arguing, and the answer can only be written into docs and watched over by review and regression tests. The guard here has a signature short enough for one line, and its return type contains no value for \"allow\": either it gives a reason for refusal, or it says nothing. Evaluation runs the global layer first, then walks the scope chain from far to near, stopping at the first reason. However many you hang on, in whatever order, however a hot reload shuffles them, none of it can flip an existing refusal back to permission.",
+   "why": "\"Can only tighten\" stops being a documented agreement and becomes a fact of the type."
+  },
+  {
+   "name": "Visibility Is Computed Once",
+   "how": "The usual approach recomputes \"what can this agent see\" wherever it's needed — once for the prompt, once for the execution decision, once for concurrency classification. None of it is long, and the cost is that the copies slowly diverge. Here there's one exit: a single walk of the scope chain producing the visible definitions, the known names from before filtering, and the global names filtering may touch. Nearer layers shadow farther ones, filtering applies to the inherited surface but not to what this layer registered itself, and the code-execution tool is appended at the end and exempt from filtering. Lookup, projection, execution resolution, concurrency classification, interface listing — all of it comes out of that one exit.",
+   "why": "No second implementation, no second meaning."
+  },
+  {
+   "name": "The Result Has to Match This Dispatch",
+   "how": "When a caching or retry plugin wraps a call, the usual implementation takes whatever result it hands back at face value — so a stale result cached across calls, or even a result belonging to an entirely different tool, can skip output validation and go straight into the conversation. Here a weak reference remembers which dispatch each normalized result belongs to. If a wrapper hands back a result that doesn't match, it gets re-validated and re-rendered against the tool actually resolved for this call, rather than passed through as is.",
+   "why": "A wrapper can change the result; it cannot change the fact that a result must satisfy the declared output contract."
+  },
+  {
+   "name": "A Timeout Can Swap the Signal, Not the Cancellation",
+   "how": "An around-wrapper has to be able to replace the call's cancellation signal, or timeouts are impossible; and once replacement is allowed, it can just as easily cut the upstream cancellation off — a hole nobody notices in the usual implementation. Here, just before the tool body is actually invoked, the original caller's signal and the signal the wrapper substituted are fused into a new one, and after the body finishes the listeners are torn down and the original restored. Aborts come in two grades: before the tool body was invoked it's \"aborted before dispatch,\" after it's \"aborted.\" Cancellation can only override a successful result; an existing failure is more specific, so it is kept.",
+   "why": "The wrapper gets the ability to time out; it does not get the ability to cut upstream cancellation off."
+  },
+  {
+   "name": "Nested Calls Share One Lane",
+   "how": "When the model writes programs that call tools, the laziest implementation lets the program run things concurrently however it likes and writes the log in arrival order. The cost is that the same tool gets different concurrency guarantees inside a program than it does in the native loop. Here every stage with an ordering requirement — the start log, the front gate and guard, the post-verdict, the settlement log — is threaded through one lane, and only the tool body itself leaves the lane to run in parallel, up to a configurable ceiling. An exclusive call waits for the pool to drain and runs alone, its barrier holding until its post-verdict is done; concurrency classification is re-read before each start, because the registry may have changed while the call sat in the queue.",
+   "why": "A tool doesn't get different scheduling semantics just because it's running inside a program."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Encode \"can only tighten\" into the return type, not into the docs.",
+   "why": "The guard's return type has no allow branch, so \"can a later-registered plugin flip a refusal back to permission\" isn't even a question the language can pose. It needs no registration-order agreement, no reviewer watching for it, no regression test guarding it — and adding a new guard doesn't mean going back to re-audit every existing one."
+  },
+  {
+   "lesson": "End an operation that is certain to fail before it reaches extensible policy.",
+   "why": "If a doomed call runs the whole policy pipeline, an approval prompt pops up, the audit records a line, and every policy listener does a round of work for something that cannot happen. The worst version is a user actually clicking approve on it. Ending it early deletes that entire class of noise from the system instead of hoping every listener is careful on its own."
+  },
+  {
+   "lesson": "A refusal should carry a way out, not just say no.",
+   "why": "When a model gets a bare \"unknown tool\" for something the prompt just declared, it's more likely to decide the deployment is broken than to fix how it called. Put the correct path into the refusal text and it corrects itself on the next turn, instead of groping toward it through a few more failures."
+  },
+  {
+   "lesson": "The same validation can have two failure modes, chosen by consumer.",
+   "why": "On the execution path, invalid arguments must throw, or bad data travels all the way into the tool body; on the display path, invalid arguments should fall back to generic rendering, because session logs outlive format declarations. Replaying an old log written under an old format shouldn't blow up today's UI."
+  },
+  {
+   "lesson": "Give \"who can see what\" exactly one resolver.",
+   "why": "Visibility is consumed by prompt projection, execution resolution, concurrency classification, and interface generation all at once. Implemented separately, a change in one place doesn't follow into the others, and the symptom is a model told a tool exists but unable to call it — or the reverse, reaching a tool that was never declared to it."
+  }
+ ],
+ "tradeoffs": [
+  "The ceremony of writing a tool isn't light: the author-facing format description has to compile down to a restricted declaration subset, the output needs a declared format plus two projection functions, and then there are two optional display functions and a concurrency classifier. The registry's main file runs to nearly two thousand lines, and following one call end to end means crossing several stages.",
+  "Cancellation is cooperative. The registry guarantees it won't abandon an async execution already under way, but in-process code can't be killed outright: a tool body that ignores the cancellation signal drags the abort along until it finishes on its own. Declaring a timeout budget amounts to promising you're cooperative, and nothing enforces that promise.",
+  "The content transform at the end of the pipeline must be synchronous and must not throw; the registry gives it no tolerance, and that contract can only live in the docs — a return type can't express \"always succeeds.\" If it does throw, the throw is turned into a failure at the result-settling stage, and the envelope the tool wanted to add is lost entirely.",
+  "The runtime language for code execution is read independently in two places, prompt assembly and program execution, and isn't bound to a single request. The interface-generation side already knows two languages, but only one runtime backend ships today, so the two reads necessarily agree. Once a second backend lands, a program written against one interface could be handed to the other runtime.",
+  "Per-agent allow and deny filtering composes visibility; it is not a permission boundary. It decides what the model sees in the prompt and what it can call, but a plugin in the same process can still reach the registry directly and run any tool; the repo's own docs list scope security as an explicit non-goal.",
+  "Replacing content in the post-verdict is not a confidentiality boundary. The replacement only changes the text the model sees; the machine value stays in the result untouched, and programmatic consumers still get it. To actually withhold something you have to replace the value itself, or block the call outright."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/core/tools/src/index.ts",
+   "note": "Registry, visibility view, the five-segment pipeline, cancellation fusing, and result settling; 1946 lines in one file"
+  },
+  {
+   "path": "packages/core/tools/src/schema.ts",
+   "note": "Author-facing format description, the tool-definition entry point, and soft validation for display functions"
+  },
+  {
+   "path": "packages/core/tools/src/code-mode.ts",
+   "note": "The code-execution tool, the single-lane scheduler for nested calls, and per-language model-visible copy"
+  },
+  {
+   "path": "packages/core/tools/src/presentation.ts",
+   "note": "The type vocabulary for card render intent: terminal, diff, search, file read"
+  },
+  {
+   "path": "packages/core/tools/src/invariant.ts",
+   "note": "Checks for stage monotonicity, result freezing, and turn-wrapping of nested dispatch events"
+  },
+  {
+   "path": "packages/core/tools/src/json-schema.ts",
+   "note": "The enforced subset of format declarations, and value validation"
+  },
+  {
+   "path": "packages/core/tools/src/ts-types.ts",
+   "note": "Renders the visible tool set into the interface-listing prompt text; py-types.ts in the same directory is the Python renderer"
+  },
+  {
+   "path": "packages/interaction/user-approval/src/index.ts",
+   "note": "The approval capability's service definition, policy folding, the four-outcome vocabulary, and fail-closed normalization"
+  }
+ ],
+ "related": [
+  "agent-loop",
+  "session",
+  "system-prompt",
+  "subagent"
+ ]
+}

@@ -1,0 +1,211 @@
+{
+ "id": "typert",
+ "lede": "Where does a call between two processes most easily rot? Not the network, not concurrency — naming.\n\nSomeone on the host renames a parameter. The client keeps sending the old name. Both builds are green, both type checks are green — because the stretch in the middle is JSON, and neither side has any say over the other. By the time an empty field shows up in production, three releases have gone by.\n\nThe usual fix is to write an interface definition and generate code on both sides. It lines up, at the price of maintaining three things from then on: the real method, the definition, and the sync between them that only a human keeps.\n\nThe choice here is harsher: the interface-definition layer doesn't exist at all.\n\n**When the two sides disagree, the build fails — not some call, later.**",
+ "packages": [
+  "packages/typert/protocol",
+  "packages/typert/generator",
+  "packages/typert/registry",
+  "packages/typert/loader",
+  "packages/api/gateway",
+  "packages/api/remotes"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "Where the authority sits decides what drifts",
+   "body": [
+    "Start with the setting. There are two processes: one runs the agent, one is the interface consuming it. The interface calls methods over there, and receives events pushed from over there.",
+    "Hand-writing that layer means feeding three things at once: the method signatures over there, the JSON fields on the wire, and the call stubs over here. If any one of them drifts, you find out at runtime.",
+    "The usual move is to promote the middle one to authority — write an interface definition, generate code on both sides. That does tighten things a little, but a gap remains between it and the real implementation, and a human still fills that gap.",
+    "The approach here pushes the authority back into the implementation itself. A developer writes an ordinary class method and marks it as remotely callable; at build time an analyzer reads the whole project and extracts that method's parameters, its return value, and every type they recursively drag in, into one self-contained type graph.",
+    "That graph has one crucial property: it is detached from the compiler. Type nodes, declarations, member signatures, generic parameters, conditional types, mapped types are all preserved as plain data, and the code generator downstream eats only that data — no syntax tree, no type checker.",
+    "The benefit of that boundary isn't abstract at all: want another static tool, say one that generates a documentation catalog, and you reuse the same model instead of running the project analysis again.",
+    "There's a second split, called a face. Each process has its own compiler configuration, and the analyzer can build a program for just one face. The agent-side face produces two things at once — its own reflection manifest, and a projection of the remote contract for the interface. The interface's build re-analyzes nothing; it consumes the other side's output directly.",
+    "By default the analyzer is draconian: syntactic and semantic diagnostics, a missing type annotation on a public boundary, a cross-package reference to a non-public declaration, a declaration merge it can't preserve losslessly — any one of them fails the build outright. It does keep a backfill mode that writes inferred annotations back into the source, rebuilds the program, and runs one clean pass over it again.",
+    "**What actually got replaced here isn't a tool — it's where the authority sits: there's no longer a file that describes the interface, only an implementation that is the interface.**"
+   ]
+  },
+  {
+   "heading": "Field names aren't picked. They're computed.",
+   "body": [
+    "The argument object on the wire is a flat, named structure. Every field name is decided by the declaration, and nowhere is a hand-written mapping allowed.",
+    "Plain JSON parameters are the easy case: the field name is the parameter name.",
+    "The awkward ones are parameters pointing at live objects on the host — the agent belonging to some session, say. That kind of thing can't cross the wire; only its id can.",
+    "The usual move is to have the developer add an annotation saying this parameter travels as an id and here is what the field is called. But allowing a human to name it is the same as allowing a human to name it wrong.",
+    "The rule here: the field name is the lookup key plus Id, and the analyzer requires the parameter name to match the lookup key letter for letter. Getting the name wrong is a build failure, not an empty value at runtime.",
+    "A method declared to run inside some context scope also spends a field on the receiver's identity, named the same way — the context key plus Id. A collision, whether with a parameter or between two parameters, is reported as a conflict at build time.",
+    "The method signature itself is narrowed a great deal: no rest parameters, no default values, no destructuring bindings, no generic methods; it must be a public, non-static instance method with a body.",
+    "The cancellation signal is the one reserved parameter: fixed name, fixed type, and it must come last. Matching two of the three conditions is still wrong.",
+    "One more rule exists purely to stop something being quietly serialized that shouldn't be: if a parameter's type is a class from this workspace and that class hasn't been registered as a lookup, the build fails and demands the registration.",
+    "That rule carries more weight than it looks — it turns \"live objects cross the wire only as ids\" from a verbal agreement into a compile-time constraint.",
+    "**Once consistency can be computed from a rule, no box should be left for a human to fill in.**"
+   ]
+  },
+  {
+   "heading": "The type being right doesn't mean it survives the wire",
+   "body": [
+    "The full path of one call is worth walking, because each leg blocks a different class of mistake.",
+    "When the client starts a call, it first parses every argument with the generated validator — that step catches type errors locally, with nothing going out at all. Then it assembles the argument object and sends an RPC over the transport connection; the endpoint is written as namespace-slash-method, and the payload must be a plain object carrying exactly one field of arguments.",
+    "The host intercepts one fixed route, looks up the call descriptor by endpoint, and does a strict field comparison: one extra field, or one missing required field, is rejected outright, with no lenient fallback. Only fields the descriptor explicitly marks as omittable may be left out.",
+    "Common practice is more forgiving here — just ignore the extra field. But ignoring an extra field means silently accepting that the sender is on a different version than you, and then executing anyway.",
+    "Next it exchanges the receiver: a direct call uses the host's own context, while a scoped call hands the identity field to the context provider and gets a live scope back. Lookup parameters work the same way — the id goes to the lookup provider and a live object comes back.",
+    "Before that exchange there's another check: the field name and type token the provider declares must line up with the descriptor, and a mismatch raises an error. This blocks a provider and a generated contract coming from different versions — that kind of mismatch doesn't fail the call, it quietly gives the call a different meaning, which is far harder to track down than a failure.",
+    "The return value goes through the same drill: first the generated validator, then a hand-written JSON safety sweep.",
+    "That sweep exists to reject one family of things: non-finite numbers, circular references, sparse arrays or arrays with extra properties, non-plain objects, symbol properties, getter properties. It detects cycles as it recurses using a set of ancestors.",
+    "It isn't blocking type errors. It's blocking values that pass the type check and then quietly deform once serialized.",
+    "**The type system governs what a value is; serialization governs whether it arrives unchanged. Press the two into one layer and you end up debugging an object in production that no longer looks like what you sent.**"
+   ]
+  },
+  {
+   "heading": "Leniency only gets to live inside one process",
+   "body": [
+    "A generation pipeline can't cover everything in a day. There are always methods not in it yet that already want to be called.",
+    "So the host keeps a source-inference path: read the marker off the live service instance, take the namespace from the frozen binding object on the service, parse the function's source text for parameter names, and assemble a call descriptor on the spot.",
+    "Descriptors assembled that way have every codec slot explicitly marked unvalidated — no generated validator, only that JSON sweep left underneath.",
+    "The usual approach stops here: leave an escape hatch, document it, remind everyone not to use it in production. But as long as the producer holds the key to the hatch, sooner or later it gets pushed open.",
+    "Here the veto goes to the consumer. When the client mounts a remote contract it checks the codec mode field by field, and anything that isn't strict throws on the spot; when the loader imports a host manifest it likewise demands that every codec slot be strict, backed by a real validator instance.",
+    "In other words, source inference serves only calls that are in-process and not yet in the generation pipeline. The cross-process half never eats an inferred result — not because everyone is disciplined, but because the other end simply doesn't accept it.",
+    "The asymmetry has a second half: the downgrade fence.",
+    "The registry keeps a grow-only record for every endpoint. Once an endpoint has been strictly registered even once, the record stays even after the plugin unloads. If a descriptor lookup finds the live strict definition gone but a record present, it refuses to fall back to source inference and raises an explicit error.",
+    "That same record drives route claiming — even with the definition revoked, the route is still claimed and returns an explicit error instead of falling through to some other handler.",
+    "The most dangerous moment for a downgrade is never when it gets switched on. It's when it takes over after the strict path has quietly disappeared.",
+    "**Who honors a rule decides whether momentary convenience can route around it. A constraint written in a comment and a constraint written into the other end's validation are not the same kind of thing.**"
+   ]
+  },
+  {
+   "heading": "Eleven array entries govern two processes",
+   "body": [
+    "Events pushed from the host to the client travel a different channel.",
+    "The usual move is a projection layer per event: the host's internal event isn't fit to hand outward as is, so you map, redact, and rename them one by one. That layer isn't hard to write and is pure liability to maintain — every new event adds a mapping, every payload change means two edits.",
+    "The choice here is not to project. Allow-listed events are forwarded verbatim, the name on the wire is the host's internal event name, and the payload is its argument list. The only knob is whether to forward an event, never whether to forward part of one.",
+    "The allow-list is a constant array, eleven entries at the moment.",
+    "A type assertion sits at the end of the array and nails three things down at compile time: every name must be a genuinely declared event; nothing may be bound to a scope — a scoped event carries a bound receiver in its type, and this is the static way of saying no dependency on session scope; and it must be one-way — waterfall or interruptible events send something back, and those are excluded across the board.",
+    "The same array also determines, in reverse, which subscription keys are legal on the consumer side: its element type fills a reserved selection slot in the protocol package, and the set of keys a client can subscribe to is the intersection of that slot with the events that actually exist in the current compilation face.",
+    "Forwarding a new event is one more line in the array, and everything else follows automatically; getting it wrong fails at compile time, rather than pushing one message in production that should never have gone out.",
+    "The host attaches a listener per array entry and pushes each event over in a uniform frame; the client hands what arrives to a subscription table for dispatch, iterating a snapshot in registration order, with a listener that throws or returns a failed async result isolated on the spot. The dispatch entry point takes the event name as a bare string — that's the wire boundary, and a name nobody subscribed to is dropped silently.",
+    "There's one more thing on the client side that's easy to get wrong: a remote namespace usually gets implemented as an intercepting proxy that manufactures a function on the fly whenever a property is accessed.",
+    "That isn't what happens here. Each remote namespace is a real framework sub-service, with methods installed one at a time. The payoff is direct: method lookup, type exposure, and the framework's own call tracing all take the normal path, and on unload the properties are genuinely deleted instead of leaving the illusion that anything you touch is there.",
+    "A method can also carry both a direct and a scoped variant. A call asks the identity binder first: can an identity be read out of the caller's context? If yes, it takes the scoped variant, the identity fills the wire field automatically, and the matching id parameter disappears from the argument list; if no, it falls back to the direct variant, which requires the id explicitly.",
+    "**The same method therefore works inside a session and at the root context alike — written differently, the same contract.**"
+   ]
+  },
+  {
+   "heading": "A failed call is a result; a wiring mistake is a bug",
+   "body": [
+    "The easiest thing to get wrong about remote calls is collapsing two entirely different kinds of failure into one.",
+    "One kind is a normal outcome of the call: the other end is offline, the request was cancelled, the target method has been unloaded. These happen at any time, and the caller was always supposed to handle them.",
+    "The other kind is code written wrong: the wrong number of arguments, a scoped call with no identity binder to be found, a method with neither of its two variants installed.",
+    "The usual approach throws for all of it. So every call site wraps a catch-all, and that catch-all covers both kinds at once — a real bug gets swallowed and looks like nothing more than this call failed.",
+    "The line here is drawn hard: a remote call returns an explicit success-or-failure union, with transport problems folded into the failure branch; only wiring errors throw.",
+    "A lookup refusal gets its own channel. A provider can throw a lookup failure with a typed payload — session doesn't exist, agent is busy — which the host recognizes and passes to the transport unchanged, instead of flattening it into a generic internal error. A domain error therefore keeps its own shape.",
+    "Cancellation merges two levels: the client combines the signal the caller passed in with the one carried by its mount token, so unloading a remote contract cuts off in-flight requests along with it. On the host, if a business method throws only after the signal has already aborted, that gets classified as a cancellation rather than an internal error.",
+    "Mounts and unmounts are serialized so concurrent mounts can't interleave; a mount that fails partway rolls back the already-installed methods in reverse order and revokes the registry entries. A namespace service destroys itself when its last method is removed.",
+    "The loader side is automatic: it listens for plugin mount events, marks the corresponding config entry name dirty, reconciles in batches on a microtask, resolves the package metadata, imports the host manifest, validates it field by field, and registers it; when the entry unloads, it revokes.",
+    "The startup scan aggregates every failure into one error and throws them together; in steady state it's one log line per package, and one bad package doesn't drag the others down.",
+    "**The difference between these two treatments comes down to admitting one thing: not every error should be caught by the same layer of code.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Analyze once, consume from both ends",
+   "how": "The usual approach runs type analysis on both ends, or writes a neutral interface definition to serve as the authority. Here each process is treated as its own compilation face, the analyzer builds a program for just one face, and public exports, services, events, and every type reachable from them are extracted into a plain-data type graph — generic parameters and applications, inheritance, conditional and mapped types, and doc comments all preserved. The agent-side face emits both its own reflection manifest and a contract projection for the interface, which the interface's build consumes directly rather than re-analyzing. The code generator eats only that data: no syntax tree, no type checker.",
+   "why": "One analysis serves three uses — code generation, documentation catalog, contract projection — and the generation logic never has to work out how types evaluate."
+  },
+  {
+   "name": "Wire field names are computed from the declaration",
+   "how": "The usual approach annotates the parameter and lets a human specify what it's called on the wire. Here not a single hand-written mapping slot is left: a plain JSON parameter's field name is the parameter name; a parameter pointing at a live host object gets the lookup key plus Id, with the parameter name forced to match the lookup key; a scoped call's receiver identity also takes a field, named the context key plus Id. Any duplicate name — between parameters, or between a parameter and the receiver — is rejected at build time. Rest parameters, default values, destructuring bindings, and generic methods are all forbidden, and the cancellation signal's name, type, and position are hard conventions where matching two of the three still counts as wrong.",
+   "why": "Both ends take their field names from the same declaration, so drift surfaces at build time instead of inside some call."
+  },
+  {
+   "name": "Validate at both ends, then screen for serializability",
+   "how": "The usual approach trusts one end and has the other only deserialize. Here every parameter, receiver identity, and return value carries a validator generated from the resolved type, plus a type token: the client parses the arguments before sending and parses the result again on arrival; the host parses on receipt and parses again before returning. The type token also drives a consistency check against the fields a runtime provider declares, and a mismatch errors out. After validation comes a hand-written recursive sweep that rejects non-finite numbers, circular references, sparse arrays or arrays with extra keys, non-plain objects, symbol properties, and getter properties, detecting cycles with a set of ancestors as it recurses.",
+   "why": "A correct type doesn't mean it survives serialization unchanged; this sweep exists for the values that pass the type check but can't cross the wire."
+  },
+  {
+   "name": "A grow-only endpoint record",
+   "how": "The usual approach falls back to the lenient path once the live definition is gone, or acts as though the route never existed. Here the registry keeps a grow-only record alongside its live entries: revoking a registration deletes only the live entry, and the record stays. When the host looks up a call descriptor and the live definition is missing but the record hits, it neither falls back nor pretends not to recognize the endpoint — it returns an explicit definition-no-longer-available. Route claiming reads that same record, so this path never falls through to another handler.",
+   "why": "It stops a single plugin unload from quietly turning a once strictly validated endpoint into an unvalidated one."
+  },
+  {
+   "name": "Lenient mode is vetoed by the other end",
+   "how": "The host keeps a source-inference path: with no generated contract, it reads the marker off the live service instance, takes the namespace from the frozen binding object, parses the function's source text for parameter names, and assembles a descriptor on the spot with every codec slot marked unvalidated. The usual approach stops here and leans on documentation and good behavior. Here the veto belongs to the consumer: mounting a remote contract checks the codec mode field by field and throws immediately on anything non-strict, and the loader importing a host manifest likewise demands every codec slot be strict and backed by a real validator instance. Leniency can therefore only live inside the host process.",
+   "why": "A rule honored by the consumer can't be routed around for the producer's momentary convenience."
+  },
+  {
+   "name": "A remote namespace is a real service",
+   "how": "The usual approach catches every property access with an intercepting proxy and manufactures the call function on the fly — the least effort to write, at the cost of method lookup, type exposure, and call tracing all bypassing the framework's normal path, and properties that still look present after unload. Here each remote namespace is a real framework sub-service with methods installed one at a time; a get captures the caller's context first and then returns a bound function, and both the method name and the namespace must clear a collision check against the service's own fields. On unload the properties are genuinely deleted.",
+   "why": "After unload, nothing is left pretending to be there for anyone who touches it."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Derive wire field names from the declaration and leave no slot for a manual mapping.",
+   "why": "Anywhere a human writes down that this parameter corresponds to that field is an entrance for drift. Fix the naming rule as a function, then make the build reject every spelling that violates it, and field consistency stops being a discipline problem and becomes a compile problem — and compile problems report themselves."
+  },
+  {
+   "lesson": "Fence the downgrade path with a grow-only record.",
+   "why": "The most dangerous moment for a lenient fallback isn't the moment it gets turned on — it's the moment it takes over after the strict path has quietly disappeared. Recording that this endpoint was once strict, and refusing to fall back on that basis, turns a plugin unload into an explicit error rather than a silently downgraded endpoint that looks perfectly fine."
+  },
+  {
+   "lesson": "Write the scope of what leniency is allowed into the other end's validation, not into a comment.",
+   "why": "Unvalidated inference is allowed inside the host process, while the cross-process end accepts only generated contracts — an asymmetry enforced by the consumer's field-by-field check at mount time. A rule is dependable only when whoever uses it enforces it; a rule the producer merely promises to itself gets routed around once on some deadline afternoon, and after that there's no going back."
+  },
+  {
+   "lesson": "After type validation passes, still verify serializability separately.",
+   "why": "Circular references, sparse arrays, getter properties, and non-finite numbers all stroll straight through static type checking, then quietly deform or throw outright at serialization time. Put that check after encoding and before the wire, and the failure lands somewhere that can still give an accurate diagnosis, rather than on the far end holding a value nobody can trace back."
+  },
+  {
+   "lesson": "Separate a failed call from a failed wiring, and express them with different mechanisms.",
+   "why": "Offline, cancelled, and target-already-unloaded are normal outcomes of a call and belong in the failure branch of the return value for the caller to handle; the wrong argument count or a missing binder is code written wrong and should throw. Mixed together, they force a catch-all at every call site — and that catch-all is exactly what swallows the real bugs."
+  }
+ ],
+ "tradeoffs": [
+  "Build-time analysis is a full project analysis, and the cost shows up directly in build time. It also fails strictly by default — any semantic diagnostic, any missing annotation on a public boundary, any cross-package reference to a non-public declaration halts generation, so bringing in a new package usually means a first round of adding annotations.",
+  "Remote method signatures are narrowed a lot: no rest parameters, default values, destructuring bindings, or generics, and the cancellation signal's name and position are hard conventions. Those restrictions are a real loss of freedom for whoever writes the business logic, bought in exchange for signatures that can be projected mechanically to the other end.",
+  "The generated validators cover a deliberately chosen subset of the type graph: a generic validator export, or a construct rooted in a conditional or mapped type, currently fails outright rather than degrading. Run into one of those and the only way out is rewriting the declaration.",
+  "Package-level artifacts are cached by name and never expire, so a change to the plugin set takes a restart; a package that fails to resolve, or has no matching export, is permanently recorded as a negative result too. What that buys is zero repeated resolution in steady state, at the cost of something mildly counterintuitive during development.",
+  "All four runtime tables are written on the premise that a duplicate registration is rejected outright, which leaves many branches unreachable and explicitly excluded from coverage. That gives the code a fair number of can't-get-here comments, and it means that if the premise is ever broken, how things fail is hard to predict.",
+  "Event forwarding is verbatim: no projection, no redaction, no renaming. The only knob is whether to forward an event, not whether to forward part of one. Narrowing a payload means going back and changing the event's own declaration."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/typert/protocol/src/types.ts",
+   "note": "Type foundation for call descriptors, codecs, the four registry interfaces, and the event allow-list"
+  },
+  {
+   "path": "packages/typert/protocol/src/index.ts",
+   "note": "Decorators for remote and scoped calls, service binding, and the lookup-failure exception"
+  },
+  {
+   "path": "packages/typert/generator/src/analyzer.ts",
+   "note": "TypeScript project analysis; wire field derivation and signature restrictions are rejected here"
+  },
+  {
+   "path": "packages/typert/generator/src/emitter.ts",
+   "note": "Renders the host manifest and the client remote contract, plus its module augmentation declarations, from the model"
+  },
+  {
+   "path": "packages/typert/registry/src/service.ts",
+   "note": "The four runtime tables; the endpoint record set is where the downgrade fence lives"
+  },
+  {
+   "path": "packages/typert/loader/src/index.ts",
+   "note": "Incrementally discovers, validates, and registers each package's host manifest by config entry"
+  },
+  {
+   "path": "packages/api/gateway/src/index.ts",
+   "note": "Host-side dispatch: descriptor lookup, argument comparison, provider exchange, JSON safety sweep"
+  },
+  {
+   "path": "packages/api/gateway/src/client/index.ts",
+   "note": "Client namespace sub-services, dual-variant calls, event subscription and dispatch"
+  }
+ ],
+ "related": [
+  "cordis-core",
+  "cordis-loader",
+  "web-client",
+  "engineering"
+ ]
+}

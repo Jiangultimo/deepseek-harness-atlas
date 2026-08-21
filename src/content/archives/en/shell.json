@@ -1,0 +1,210 @@
+{
+ "id": "shell",
+ "lede": "Letting an agent run a command sounds like the least demanding thing in the whole harness: the model writes some text, you hand it to the system, you wait for output.\n\nActually build it once and you find out that before that text reaches the operating system, a pile of things the model never said — and shouldn't be the one saying — have to be decided on its behalf: which directory to run in, how long counts as a timeout, how much output to keep, what the environment may carry, who gets killed when the user hits cancel.\n\nThe trouble is that when those decisions stay vague, the failure mode usually isn't an error. It's a wrong result that looks perfectly normal.\n\n**What's worth watching here isn't how the command gets run — it's which layer all those unwritten decisions end up landing in.**",
+ "packages": [
+  "packages/shell/shell",
+  "packages/shell/bash-local",
+  "packages/shell/bash-sandbox",
+  "packages/shell/pwsh-local",
+  "packages/shell/shell-env",
+  "packages/shell/tool-bash",
+  "packages/subprocess/subprocess",
+  "packages/subprocess/subprocess-local",
+  "packages/util/timeout"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "One command crosses four layers before it touches the system",
+   "body": [
+    "What the model gets to fill in is pitifully little: a line of command text, one human-readable description, plus three optional fields — timeout, working directory, and whether to throw it into the background. That's it.",
+    "That isn't something you can hand to an operating system. To actually run it you still need to know how much output to keep, what the environment carries, and who gets killed on an interrupt.",
+    "The usual approach stuffs all of those decisions into one function: take the command, fill in defaults along the way, start the process along the way, collect output along the way. Fastest thing to write, and a year later nobody can tell you why a particular default is the number it is.",
+    "Here it's split into four layers. On top is the tool the model sees, which handles nothing but argument validation and text rendering. One layer down is the capability interface — it spells out the signature and the semantics of \"run one command\" and not a word about how.",
+    "Only below that is the implementation. The local one hands the command to bash to interpret; the sandboxed one inherits it outright and swaps only the thing being executed for a restricted runner; the Windows one swaps in PowerShell. All three share a single settings namespace — what gets named is the capability, not the implementation, so the same settings document still parses on another platform.",
+    "At the bottom is the subprocess layer, which has no idea what a shell is. It takes a fully specified argument array, a directory, what to do with each stream, how long the grace period runs, and hands back a handle on a process tree.",
+    "**The value of that layer is precisely that it recognizes nobody.** Language servers, terminal sessions, subagent runners are all on the same process machinery — managing processes never had anything to do with whether the command is bash."
+   ]
+  },
+  {
+   "heading": "Who fills in the blank nobody filled",
+   "body": [
+    "Anyone who has built one of these has written this line: take the timeout from the request, and if it isn't there, use an internal constant.",
+    "There's nothing wrong with the line. What's wrong is where it lives.",
+    "It hides inside the execute function, so every implementation grows its own set of defaults, and the caller never knows which number actually takes effect until the thing is already running.",
+    "The approach here is to split \"request\" and \"spec\" into two types. In a request, the working directory, the timeout, and the output budget may all be absent; in a spec they must all be there. And the execute step eats only specs.",
+    "Filling in the blanks is promoted into a public step on the interface: request in, spec out. Fill the directory, clamp the timeout to the ceiling, supply the output budget, pass everything else through untouched. The local implementation's numbers are a two-minute default, a ten-minute cap, a 64,000-byte output window — and all of them live in configuration, not in code.",
+    "**A missing field is no longer a runtime fallback. It's a compile-time type mismatch.**",
+    "Put differently, this isn't strictness, it's ownership: deployment-specific values belong in the caller's own configuration, not buried inside a service everyone shares.",
+    "The sandboxed implementation overrides only that filling-in step, adds one field, and doesn't change a word of the execution itself. One layer further down it's stricter still — the subprocess spec has no optionals at all: the disposition of every stream, every ceiling, the grace period, all given explicitly.",
+    "Once defaults have exactly one place to land, \"which value did this run actually use\" stops being a question you answer by reading source and becomes something you can print out and look at."
+   ]
+  },
+  {
+   "heading": "Timeout and cancel — only one of them can be true",
+   "body": [
+    "A command stops halfway for one of two reasons: either it timed out, or the user hit cancel.",
+    "Sounds like two separate things. In practice they race almost by definition — at the moment the user cancels, the timeout may be firing too.",
+    "The usual approach judges each on its own: one boolean for timed out, one for cancelled. The race arrives and you get both true, or both false.",
+    "Here the two are fused into a single signal. The timeout path fires with a reason carrying a private code, the cancel path carries the caller's own reason, whoever arrives first wins, and the late arrival gets no chance to overwrite.",
+    "So the two booleans in the result have one arbiter: timed out is true if and only if the reason carries exactly this run's private code; aborted is true when it means \"really was interrupted, but not by my timeout.\"",
+    "That brings a very clean side effect: an outer, larger deadline landing on the run gets recorded as a cancel rather than a timeout — the code doesn't match, and it never was this run's timeout.",
+    "**Mutual exclusion becomes a structural property instead of a coincidence propped up by the order of the checks.**",
+    "Or push it one step further: why can't a timeout be reported through the exit code?",
+    "Because a command can perfectly well catch the termination signal, finish its cleanup, and exit 0. Interruption has to be reported independently of the exit code, or what the model sees is a success.",
+    "Background execution has no timeout at all: the fusing step is skipped, and the process stops only on an explicit kill or the caller's signal. That isn't an oversight — background jobs exist to run long work, and giving one a deadline would be the strange choice."
+   ]
+  },
+  {
+   "heading": "Scrub the environment clean, then lay it back in three layers",
+   "body": [
+    "A child process inherits the parent's entire environment by default. In a harness, what that sentence means is: every command the agent runs can read your model key by default.",
+    "The usual approach deletes a few variables when someone remembers to. The problem is that remembering isn't a mechanism.",
+    "Here every child process starts from the same baseline: any entry in the parent environment whose name contains key, password, secret, or token, plus every entry carrying the managed prefix, is not passed through. Search path, home directory, locale, proxy settings all stay — command-line tools inside the child have to behave normally.",
+    "Both checks are case-insensitive, for a reason specific enough to be funny: Windows environment variable names are case-insensitive, so a lowercase managed entry would otherwise survive and then be read back inside the child in uppercase.",
+    "The scrubbing is written as an ordinary function anyone can call, not something that only lives inside a service method. Because there are always places that go around the service and start processes themselves — the transport layer of the tool protocol, the SDK client, external subagent runners. Either they share this one rule, or each writes its own and they slowly drift apart.",
+    "Only after the scrub does anything get laid back on top, and the order is deliberate:",
+    "- First, the terminal overrides that make tool output readable: turn off color escapes, declare the dumbest terminal type there is, swap the pager for a program that just dumps its input",
+    "- Then the caller's own ordinary environment",
+    "- Last, the trusted managed snapshot",
+    "Order is priority: a caller's entry can never overwrite a managed fact; and a credential written in explicitly does get through the scrub on purpose — the scrub guards against implicit leakage, it doesn't forbid you from passing something deliberately.",
+    "The managed part isn't a constant table either — it's computed fresh every time the model calls a command. The home directory, the shell marker, and the session id are owned by the registry itself; plugins register \"contributors\" to add more enumerable facts, like the absolute path of the current session log. Unload the plugin and the contribution is withdrawn on its own.",
+    "**A fact you can't obtain right now shouldn't silently inherit a stale value from the process — it should simply not exist. Absence is discoverable; the stale value isn't.**"
+   ]
+  },
+  {
+   "heading": "Keep the tail, write the head to disk",
+   "body": [
+    "A command can spew two hundred megabytes of logs while the model's context holds a few thousand words. Truncation is inevitable; the question is which end you cut.",
+    "Most implementations keep the beginning and add an ellipsis. That throws away exactly the part you wanted — error messages, the reason for failure, the final verdict all cluster at the end of the output.",
+    "Here it's the tail that's kept. Over the limit, whole chunks are dropped from the front, and the first surviving chunk is cut open when necessary so the retained window is exactly the limit in bytes.",
+    "The head doesn't vanish, though. On the first overflow a file is created lazily, the chunks already collected are backfilled into it, and every chunk after that is written. Tail into context, full text onto disk — both needs are met, and both have an explicit ceiling.",
+    "How that file gets created is worth a sentence: a random suffix, exclusive creation (any existing path, symlinks included, fails), owner-only permissions, and a temp directory private to this process. What that guards against is path prediction and symlink planting in a shared temp directory — if someone can create the path before you, what you write into is their file.",
+    "The overflow file has one hard rule: once the whole stream passes the overflow limit, the file is closed and deleted, overflow is disabled for good, and reads stop reporting the path at all.",
+    "**Better to be left with only that tail in memory than to keep a partial thing posing as \"the full output.\"**",
+    "Reads work by byte offset into the whole stream, and they don't consume. No internal cursor means two readers who don't know about each other won't eat each other's output. An offset that slides out of the memory window is marked lossy, the entire retained tail comes back, and the gap has to be looked up in the overflow file.",
+    "A foreground result is nothing but the special case of reading once from 0, where lossy happens to mean truncated; the background tool keeps its own offsets for both streams and stitches the two pieces into one increment.",
+    "What finally goes to the model isn't any of these structures but one assembled block of text: standard output, a labelled section of error output, then the truncation notice, the timeout marker, the exit code, with the exit marker pinned to the last line.",
+    "The interface side then parses backwards, plucking the exit marker out of the text to make a status badge. It sounds roundabout, but it's necessary: replay keeps only the rendered text, and by then the structured result is long gone.",
+    "Which is to say: anything the model saw has to be reconstructable from the log verbatim, so the real source of truth here is that text, not the structure that produced it."
+   ]
+  },
+  {
+   "heading": "Killing a process isn't the same as killing it clean",
+   "body": [
+    "Almost everyone has fallen into this one: you kill a process, wait for its exit event, assume cleanup is done, and then find the compiler it started still running, holding a port, writing files.",
+    "The lead process being dead doesn't mean the tree is dead.",
+    "The usual approach kills the process id, listens for the exit event, done. It passes most of the time, until the time it doesn't.",
+    "On POSIX, every child launched here detaches into its own process group and becomes the root of a tree; Windows has no such concept, so it uses a tree-kill command keyed on the root process id. Outward there is one verb for stopping: send the termination signal to the whole tree first, then the hard kill once the grace period is up.",
+    "The stroke that actually matters is this — the hard-kill timer is not cancelled when the direct child settles.",
+    "Because the lead process exiting is precisely the signal most easily mistaken for \"cleanup finished.\" The timer stays, and until it fires it re-probes every 15 milliseconds: first a do-nothing probe signal asking \"still there?\"; on Linux, after the direct child settles, there's a further check that the group isn't all zombies — a group that can only answer signals and do nothing else doesn't count as alive.",
+    "And once the tree is genuinely observed gone, that fact is permanent: the pending escalation is cancelled. Not to save effort — to avoid killing the wrong thing. Process group ids get reused, and a late hard kill can land on a process that has nothing to do with any of this.",
+    "The service layer holds every live handle; on a normal unload it stops them and waits for the whole tree to exit, and a handle leaves the set only after its tree is gone. There's also a synchronous hook on the process-exit phase that hard-kills whatever trees remain — at that moment you can neither wait nor throw.",
+    "That ownership line also explains one concrete behavior: a background command lives as long as the process service does, not as long as the command-executor plugin does. Hot-reload the executor and the background jobs already running are not killed.",
+    "**Change the wait condition from \"the exit event arrived\" to \"nothing answers the probe,\" and only then does \"cleanup is done\" become a claim you can verify.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Fill in the blanks before executing, and put that step in the signature",
+   "how": "The usual approach lets the execute function cover for itself: no timeout given, use an internal constant; no directory given, use the current one. Defaults scatter across every implementation, a different implementation brings a different set, and the caller can't see the final values until the thing runs. Here request and spec are split into two types: in a request the working directory, timeout, and output budget may all be absent; in a spec they must all be present; and execution accepts only specs. Filling in the blanks is promoted into a public step on the interface, request in and spec out — fill the directory, clamp the timeout to the configured ceiling, pass the rest through untouched. A missing field is then not a runtime fallback but a compile-time type mismatch.",
+   "why": "It gives \"where did this default come from\" one readable place to land, and the output of that step can be printed and inspected on its own."
+  },
+  {
+   "name": "One signal decides, first arrival leaves its name",
+   "how": "The usual approach keeps one boolean for timeout and one for cancel, each judged on its own; when the two race you get both true or both false. Here the timeout timer and the caller's cancel signal are fused into a single signal, whichever fires first supplies the reason, and the late one gets no chance to overwrite. The timeout path carries a reason with a private code in it. Timed out in the result is true if and only if the code in the reason belongs to this run; aborted is true when it means \"really was interrupted, but not by my timeout.\" An outer, larger deadline landing on the run therefore counts as a cancel rather than a timeout.",
+   "why": "It makes mutual exclusion a structural property, and it decouples interruption from the exit code entirely — a command catching the signal and then exiting 0 is a very ordinary thing."
+  },
+  {
+   "name": "Scrub the environment first, lay it back in three layers",
+   "how": "The usual approach passes the parent environment down wholesale, at most deleting a few variables someone happened to think of. Here every child shares one baseline: entries whose names contain key, password, secret, or token, plus every managed-prefix entry, are not passed through, and both checks are case-insensitive to suit Windows. Only then do three layers go on in order: the terminal overrides that make tool output readable, the caller's own ordinary environment, and the trusted managed snapshot. Order is priority, so a caller can never overwrite a managed fact; an explicitly written string does get through the scrub on purpose, while an explicitly written empty value is a tombstone that deletes an ordinary entry.",
+   "why": "The scrub is also an ordinary function anyone can call, so the places that bypass the service and start processes themselves share the same rule instead of each writing their own and drifting apart."
+  },
+  {
+   "name": "Managed facts are computed fresh, never inherited",
+   "how": "The usual approach computes one table of variables at startup and reuses it forever. The trouble is that facts of this kind — the current session id, the path of the current session log — change from call to call by nature. Here the subprocess layer first drops every managed-prefix entry from the parent environment, and then the registry computes a fresh set for this one call: the home directory, the shell marker, and the session id are owned by the registry itself, and plugins register \"contributors\" to add more. A contributor must declare up front which keys it may return; a duplicate name, a reserved key, or an undeclared key coming back all fail outright.",
+   "why": "A fact that can't be obtained right now doesn't silently inherit a stale value from the process — it simply doesn't exist. Absence is discoverable; the stale value isn't."
+  },
+  {
+   "name": "Tail in memory, full text on disk",
+   "how": "The usual approach keeps the start of the output and adds an ellipsis, when the error messages and the final verdict are precisely at the end. Here memory holds only that last stretch: over the limit, whole chunks are dropped from the front and the first surviving chunk is cut to the exact byte, so the window is exactly the limit. The head goes into a file created lazily on the first overflow and backfilled, with every chunk written after that — a random suffix in the name, exclusive creation, owner-only permissions, in a temp directory private to this process, guarding against path prediction and symlink planting in a shared directory. Once the whole stream passes the overflow limit, the file is deleted and the path stops being reported.",
+   "why": "Better to be left with only that tail in memory than to let a partial file pose as the full output."
+  },
+  {
+   "name": "Kill the whole tree, and confirm once more before firing",
+   "how": "The usual approach kills the process id, waits for the exit event, and declares cleanup finished. But the lead process exiting doesn't mean the descendants it started have exited. On POSIX every child launched here detaches into its own process group as the root of a tree; Windows uses a tree-kill command keyed on the root process id; and outward there is one verb: the termination signal hits the whole tree, the hard kill follows the grace period. The hard-kill timer is deliberately not cleared when the direct child settles, and before it actually fires it re-probes every 15 milliseconds — a do-nothing probe signal asks the question, and on Linux there's the further check that the group isn't all zombies. Observing the tree gone is a permanent line: it cancels the pending hard kill.",
+   "why": "Process group ids get reused, and a late hard kill can land on a process that has nothing to do with any of this."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Make \"fill in the defaults\" a step on the signature, not a fallback expression inside the implementation.",
+   "why": "Once defaults hide inside the execute function, every implementation grows its own set, and the caller can't see the values that actually take effect until it runs. Promoted into a public \"request in, spec out\" step, a missing field becomes a compile error, and while debugging you can print the output of that step on its own."
+  },
+  {
+   "lesson": "Mutually exclusive conclusions must be attributed from one event source — don't let two booleans each judge on their own.",
+   "why": "Timeout and cancel race almost by definition, and judging them separately sooner or later gives you both true or both false. Fuse them into one signal, let the first arrival leave a coded reason, and read only that reason afterwards — mutual exclusion becomes a structural property instead of a coincidence propped up by call order."
+  },
+  {
+   "lesson": "Write a safe default as one rule other code can call directly, so callers that bypass the service share it too.",
+   "why": "If credential scrubbing lives only inside a service method, the places that don't go through the service — terminal backends, SDK transports, external runners — each write their own, and drift is only a matter of time. As one shared rule, every path that starts a subprocess points at it, and a new caller has no reason to rewrite it."
+  },
+  {
+   "lesson": "When truncating, keep the tail, and write the full stream into a file that has a ceiling.",
+   "why": "Errors and verdicts cluster at the end of command output, so keeping the head throws away exactly the part you need; but keeping only the tail makes long output impossible to investigate at all. Tail into context, full text onto disk with the path reported — both needs are met, and both have an explicit ceiling; the version without one fills the disk sooner or later."
+  },
+  {
+   "lesson": "Stop and wait on the process tree as the unit, and trust the probe result rather than the exit event.",
+   "why": "The direct child exiting doesn't mean the helper processes it started have exited; treat that settlement as silence and unload will declare itself finished while descendants are still alive. Target the process group or tree, wait until nothing answers the probe, and \"cleanup is done\" is a claim you can verify rather than a guess."
+  }
+ ],
+ "tradeoffs": [
+  "Every call is a brand-new shell: working directory, variables, and functions carry over across calls not at all. For the model that means it can't switch to a directory first and then work there — every command has to carry the full path itself. A marker left in the source says this is still under evaluation; whether persistent directories or terminal sessions get supported is undecided.",
+  "A background process that fails to start currently shares one result with \"killed without a signal\"; only a sandbox-runner failure can be told apart. A TODO comment in the source admits this needs an explicit infrastructure-failure state — until then, what the model sees is an ambiguous death.",
+  "The environment scrub is, in the end, a heuristic match on four English words. A credential variable containing none of them isn't stopped, and you're left hoping the caller never put it in the parent environment to begin with. It's the kind of defense that works most of the time, and it shouldn't be mistaken for isolation.",
+  "The overflow file is deleted outright the moment it passes the limit, so very large output ends up as nothing but that tail in memory, with no path reported. That's the nothing-rather-than-partial trade, and the cost is direct: the cases hardest to debug are exactly the ones with no complete record.",
+  "Liveness detection for the tree is a 15-millisecond polling loop plus a probe signal, and it keeps the event loop busy along the unload path. Windows is blunter — there's no process-group liveness probe, so the only boundary available is the direct child's exit, which means the whole tree semantics come at a discount on Windows.",
+  "The foreground standard-output budget can be set by a trusted in-process caller, while error output and background processes always use the executor's own ceiling. That asymmetry is written down only in a comment, so anyone reading the types won't know that half the freedom on offer doesn't actually exist."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/shell/shell/src/types.ts",
+   "note": "Where the request, spec, and result types are drawn apart"
+  },
+  {
+   "path": "packages/shell/shell/src/index.ts",
+   "note": "The executor abstraction and the one-implementation-per-deployment constraint"
+  },
+  {
+   "path": "packages/shell/bash-local/src/index.ts",
+   "note": "The local implementation of filling in the blanks, deadline-signal fusing, and background handles; the two-minute default and ten-minute cap are here too"
+  },
+  {
+   "path": "packages/shell/tool-bash/src/index.ts",
+   "note": "The tool the model sees, the foreground/background fork, and assembly of the output text"
+  },
+  {
+   "path": "packages/shell/shell-env/src/index.ts",
+   "note": "Contributor registration for the managed environment and the per-call snapshot"
+  },
+  {
+   "path": "packages/subprocess/subprocess/src/index.ts",
+   "note": "The subprocess capability definition and that shared credential-scrubbing rule"
+  },
+  {
+   "path": "packages/subprocess/subprocess-local/src/spawn.ts",
+   "note": "The output collector, the overflow file, the process-tree termination ladder, and the 15-millisecond liveness poll"
+  },
+  {
+   "path": "packages/util/timeout/src/index.ts",
+   "note": "Timeout clamping, signal fusing, and first-cause attribution"
+  }
+ ],
+ "related": [
+  "tools",
+  "sandbox",
+  "cordis-core",
+  "fs"
+ ]
+}

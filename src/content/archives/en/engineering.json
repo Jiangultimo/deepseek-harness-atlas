@@ -1,0 +1,215 @@
+{
+ "id": "engineering",
+ "lede": "\"CI is green\" is a remarkably unreliable sentence in a repo with two hundred-odd packages.\n\nA green light tells you exactly one thing: every check somebody wrote down passed. What it can't tell you is much larger — whether the generated catalogs still line up with the source, whether some newly grown way of writing things is covered by any rule at all, whether a refactor quietly dropped a model request and nobody noticed.\n\nThese holes have one thing in common: they don't show up as errors, they show up as silence. Whatever the checker doesn't recognize, it waves through as compliant.\n\nThe usual answer is \"tighten the conventions\" and \"pay more attention in review.\" To be blunt, as long as it rests on discipline, drift is only a matter of time.\n\nWhat this repo does instead is trade discipline for gates — a gate being one check command that either passes or fails. But what's worth watching here isn't that there are dozens of checks. It's the one temperament all of them share: hit a shape you don't recognize, and you fail.\n\n**How much you can trust a checking system depends not on what it checks, but on which way it falls by default when it runs into something it has never seen.**",
+ "packages": [
+  "scripts",
+  "packages/runtime-diagnostics/invariants",
+  "packages/test-support/llm-replay",
+  "packages/test-support/acp-snapshot",
+  "packages/examples/agent-spine-demo",
+  ".agents/notes",
+  "docs"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "One check fails. What about the other few dozen?",
+   "body": [
+    "A few dozen checks are never a flat list. If the build artifacts aren't out yet, running the consumer verification only draws conclusions about something broken; the docs comparison has to wait for type analysis to finish first. Once there are a dozen-odd relationships like that, the ordering stops being something anyone works out in their head.",
+    "The usual approach is a sequential script that runs until it doesn't. After a failure there are two endings: either the whole thing stops, and nobody knows whether the remaining dozens should have run; or it keeps going and produces a pile of misleading conclusions on top of broken artifacts.",
+    "What it does instead is write every named aggregate as an explicit dependency graph — full local, docs sync, CI mainline, CI static, coverage, snapshots, artifacts, consumer verification, plus the blocking / full / observational tiers on the Windows side.",
+    "More to the point, it validates that graph before it starts a single subprocess. Duplicate ids, a dependency pointing at a check that doesn't exist, a cycle — all three throw on the spot, rather than surfacing halfway through the run.",
+    "At run time it fills the concurrency slots with whatever has all its dependencies passing, and advances by taking whichever finishes first.",
+    "Failure propagation is written into the results. When a check fails, everything that depends on it directly or transitively is marked skipped, with a note naming which dependency dragged it down. The final exit code treats failed and skipped the same, unless a check explicitly declares that it is allowed to fail — the Windows \"full\" aggregate uses exactly that marker to demote a batch of observational checks to non-blocking.",
+    "The concurrency ceiling differs per aggregate. Full local and docs sync are held down to 4, and the comment says why: several docs checks each build a complete type-analysis program, so on a many-core machine, leaving concurrency uncapped buys you an out-of-memory crash rather than a shorter wall clock.",
+    "Subprocesses never go through a command-line shell, because Windows can't start that batch shell layer. The failure report lists three facts separately — spawn error, exit code, signal — and never lets one hide another; a process can perfectly well both time out and exit 0.",
+    "**\"This check didn't run\" and \"this check ran\" have to be two distinguishable states in the results.**",
+    "It sounds like a small thing. But almost every false \"CI is green\" leaks out through that exact crack."
+   ]
+  },
+  {
+   "heading": "Make the generator turn itself in",
+   "body": [
+    "A batch of the docs here is generated from source: the service and event catalog, the tool catalog, the config catalog, the persistence catalog, the module map, the scoped-event table, the relationship diagrams, the third-party declarations. All of it is committed.",
+    "Anything generated and committed carries staleness risk — the source changes, the generated file doesn't get regenerated, and the two start telling different stories.",
+    "The usual approach is to write a second program that compares what's on disk against the source. That looks natural enough, but checking and generating are two pieces of code, and they evolve separately. By the time they disagree about what the correct output is, what you see isn't an error — it's a false green.",
+    "What it does instead is not write the second program. The same generator takes one flag and becomes a checker: nothing written to disk, the full render run in memory, the result compared byte for byte against what's committed, and any mismatch lists the stale files and demands you rerun the generator and commit again. There are ten check commands today, and they are exactly the generators with that flag.",
+    "Missing file, different content, even a read failure all land in the same bucket — stale — because the remedy is identical.",
+    "The relationship diagrams aren't purely generated. Some facts come from source analysis: which package declares a service, which packages implement it, which consume it. The rest is a hand-written classification in the script — whether a service counts as core, as a swappable capability interface, or as a composition point.",
+    "A hand-written table and the source will come apart, so before rendering there's a completeness assertion: anything found in the source but unclassified in the table, and anything in the table that has since vanished from the source, both throw outright.",
+    "Each generated diagram states its own maintenance mode in the footer — generated, mixed, or hand-written — so a reader knows which rows were counted out of the code and which are somebody's judgment.",
+    "**When the checker and the generator share one piece of rendering code, they can't grow different expectations.**",
+    "Put differently: this doesn't save you a program. It makes an entire class of false green structurally impossible."
+   ]
+  },
+  {
+   "heading": "Something you don't recognize: wave it through, or stop it?",
+   "body": [
+    "To guarantee that every public export has documentation, step one is to enumerate the ways an export can be written: functions, classes, interfaces, type aliases, enums, constants, namespaces, re-exported aliases — a different rule for each.",
+    "The trouble is that languages grow new syntax and codebases grow new habits. A list that is exhaustive today stops being exhaustive in six months.",
+    "The usual approach is: when the dispatch chain reaches the end and recognizes nothing, return, and treat it as compliant. That's the least work, and it never produces a false positive.",
+    "The price is that every new form gets an automatic exemption, with no signal at all. The gate's promise was supposed to be \"a public API that has never been checked cannot exist\" — and a single silently-skipping branch voids it.",
+    "What it does instead is replace that last return with a violation: this gate doesn't recognize this export form, go extend the gate. An inline callable type that carries a call signature mixed in with other members gets rejected — there's no single signature to hang a doc tag on — and the fix demanded is to extract the type into a named declaration.",
+    "It also nails shut a few doors that are easy to leave open. An inherited member isn't asked for its own docs when the base class already has them, but publicly overriding a protected base member counts as new API and gets no exemption; the fixed slots of the plugin protocol are exempt by name; a leading underscore on a parameter name marks it as deliberately unused rather than renamed, and doesn't count as a mismatch.",
+    "The same temperament shows up in other checks. Type declarations pasted verbatim into the docs have their own gate, and it scans every doc file in range, not just the ones registered in the manifest — so an unregistered pasted block gets reported as an orphan, and a manifest entry with no block to match is an error too.",
+    "The directory tree for decision records is likewise a closed set: three lifecycle folders, six category folders, filenames of date plus title. Any directory name outside the set, any wrong nesting depth, any non-conforming filename is an error, because a directory the walk can't reach will hide a batch of invisible records.",
+    "Default-pass and default-fail are one line apart to write, but they are two completely different promises:",
+    "- Default-pass says: I checked the ones I recognize",
+    "- Default-fail says: nothing exists that I haven't checked",
+    "**Only the second one can actually keep anything out.**"
+   ]
+  },
+  {
+   "heading": "219 packages, 35 real assertions",
+   "body": [
+    "The type system checks shapes and unit tests check examples, but nobody owns the relationships that evolve over time.",
+    "A terminal event with no matching start event, say. A streaming delta pointing at a content block that was never opened. A persisted result whose identity doesn't match the request it came from. None of this makes the compiler complain, and none of it turns a single isolated unit test red.",
+    "The usual approach is a centralized assertion module, every known consistency check piled into one file. Fast to write, and it has one fatal property: nobody knows what it's missing, because \"which package ought to have assertions\" was never accounted for anywhere.",
+    "What it does instead is require every workspace package to have a hand-written companion module that registers its own package name and an install function. A central registry is responsible only for selection (a global switch plus allow and deny lists by package name), registration uniqueness, the lifecycle and rollback of child contexts, and attributing failures to a specific package name. The registry deliberately refers to no product package, and deliberately offers no general-purpose helper like \"assert this plugin has this method.\"",
+    "The gate walks the syntax tree package by package: the companion module must exist, must not carry a generated marker, must register exactly its own package name, must pass in the local install function that was checked, and must be a named export by convention with no default export. It also checks the package manifest's export map, published file list, dependency declarations, and project references. A non-empty install function has to actually use the failure reporter bound to that package name.",
+    "Here's the honest part: an empty implementation is allowed, but the declaration must carry a sentence with a fixed opening explaining why this package has no observable runtime relationships.",
+    "All 219 packages have a companion module. 184 of them are that kind of explained empty implementation. Only 35 assertions actually execute.",
+    "The relevant decision record explicitly rejects \"every package must write at least one assertion,\" on the grounds that assertions about method existence, plugin names, or fixed examples merely repeat what type checking and load checking already do, while checking nothing about runtime consistency. Assertions written to hit a quota are worse than no assertions, because they look like coverage.",
+    "**What's mandatory isn't the assertion. It's the answer.** A package either produces an executable consistency check or produces a reviewable sentence saying there are no observable runtime relationships here — but silence is not allowed.",
+    "One more thing has to be said plainly: none of this is mounted in the product by default. The shipped command-line preset config doesn't include the registry. It actually takes effect in two places — the global setup for unit tests, and the demo assembly used by the examples, where four are mounted explicitly: session, agent, scope, main loop.",
+    "**Which is to say: this is a development-time consistency check, not runtime self-protection.** I think that framing belongs somewhere very visible, because otherwise \"every package has runtime invariants\" is very easy to hear as something else."
+   ]
+  },
+  {
+   "heading": "Green isn't the same as no regression",
+   "body": [
+    "The coverage gate is 100% per file — statements, branches, functions, lines — across each package's source directory. That sounds aggressive, but the repo's own docs are notably restrained about what it means.",
+    "An uncovered line usually means dead code that should be deleted, not a test that should be written. Line coverage is a necessary condition and never a sufficient one — it proves the code ran, not that the feature works in its shipped form.",
+    "The gate is split into two parallel commands. A batch of heavy suites (whole-repo compile analysis, real-subprocess cases) runs separately without instrumentation, and the admission rule is written into the membership rules: every measured file such a suite touches is already fully covered by another suite, so moving it out changes no threshold conclusion. The two commands split the worker-process budget roughly 1:2, because the uninstrumented one's wall clock is set by its single longest file.",
+    "The genuinely interesting part is the snapshot tests. The old problem with replay testing is that you have one fake model script fed into the system and one expected output to compare against — two files that will drift, and the direction of drift is almost always that somebody quietly edits the expected output to match the actual.",
+    "What it does instead is give one file two jobs. A recorded session log is both the replay input — each model call's script is rebuilt out of the assistant chunk events — and the expected output: after the run, the log is persisted again and compared line by line.",
+    "Cases the log can't reconstruct — an error thrown mid-stream, a hang waiting for cancellation — have to be supplied in an explicit supplementary file. When the replayer finds a call missing its termination marker, it refuses outright instead of guessing an ending.",
+    "The most valuable assertion in this whole section runs at teardown: every recorded script must have been bound to some live session, and every bound cursor must have walked its entry list to the end, or it throws a diagnostic with the actual numbers in it.",
+    "Without that step, a regression like \"the refactor sends one fewer model request\" turns nothing red. It just quietly leaves the tail of the recording unused.",
+    "System prompts and tool definitions are large and change often. The strategy is to group them by the category of the header composition, and within each category exactly one scenario pins the full content in its own file while the rest substitute placeholders for those two blocks. Every scenario's live header still gets compared against its category's pinned version, so the only way around the coverage is to declare a new category — the cost of evading has been designed to exceed the cost of complying.",
+    "The local commit hooks are deliberately light: pre-commit runs only the bilingual record, the archive check, the staged-file checks, and the whitespace check; pre-push runs only type checking. Third-party declarations take the regenerate-rather-than-reject route — the hook just reruns the generator and adds the result to the index — while the staleness assertion in the test path stays in place, covering the deletion cases the hook can't see.",
+    "**Green says \"every assertion I wrote down holds.\" It doesn't say \"the system didn't get worse.\"**",
+    "The distance between those two sentences is exactly why an assertion like the teardown headcount exists."
+   ]
+  },
+  {
+   "heading": "A decision has to remember what it beat",
+   "body": [
+    "Decision records, left alone, decay into a running log. Six months later you open one and see only \"we did A,\" never \"why not B.\" So the same argument restarts every few months, from zero each time.",
+    "The usual approach is a category field in the file header plus an auto-generated index. It looks tidy, but both pieces have problems: a field can only be validated after you've read the file, and the files you can't reach are exactly the dangerous ones; an index is a copy that needs continuous maintenance.",
+    "What it does instead is encode the classification into the path. Lifecycle (proposed / implemented / rejected) is the top-level directory, category (feature / bugfix / simplification / architecture / process / testing) is the second, and the date it was first raised is in the filename. The status line has to agree with the directory it sits in, and the gate cross-checks the two. Cross-record references must be relative links, so that when a file moves, the links can be checked mechanically.",
+    "A central index is explicitly banned: an index file appearing in the directory is an error. The reasoning is that the live lifecycle-and-category tree is itself the listing — browse the directory or search the repo — and a generated index brings nothing but maintenance noise.",
+    "Every record must have an \"alternatives considered\" section, one paragraph per alternative, saying why it lost. The standard spells out the reason: **a decision that doesn't record what it defeated gets re-argued over and over** — which is precisely what decision records exist to prevent.",
+    "Low-value implemented records move into a separate archive tree, and the move permits exactly four kinds of edit: carrying the Chinese and English files and the consistency record across as-is, inserting the archive-date line, re-recording consistency, and fixing inbound links. Once sealed, they're frozen for good: an append-only listing holds a content hash for every archived file, CI takes a trusted pre-change commit as its baseline, and any hash change or missing entry among the sealed ones is an error. Live prose may cite them, but must not treat them as evidence of the current state.",
+    "Human-written docs are divided by layer, and the rule is one home per fact. The standards file at the root holds only the one to three lines of rules that have to be carried into every session, and links to the source; the architecture doc holds only an ordered map; subsystem pages hold type definitions; package READMEs hold that package's own contract; war stories go only into postmortems.",
+    "Writing it anywhere else is duplication, and once a duplicated rule forks, nobody knows which copy counts.",
+    "The always-loaded docs have word budgets. Over budget, you relocate first, condense second, and only then consider raising the ceiling and explaining the manifest difference in the same change. The ceiling is defined as a guardrail rather than a reduction target: under the target you leave 5% of headroom, over the target the ceiling freezes until the content has genuinely moved out. A manifest entry whose file doesn't exist is also a failure, which forces renames and deletions to update the manifest in the same change.",
+    "Docs that come in Chinese and English pairs get a sidecar record holding a content hash for each side; if either side changes without re-recording, the gate reports that they no longer match the last state confirmed consistent. Beyond hashes it compares structural signatures: the heading level sequence, the language and content of code blocks, table dimensions, list item counts, and every link target except the language-switch link. Translation quality itself is still a human review matter.",
+    "Speaking personally, what these rules have in common is that none of them leaves remembering up to anyone's memory: classification goes to the path, agreement goes to hashes, limits go to word budgets.",
+    "**Whether a repo's docs stay unrotted over the long run has never been about writing discipline. It's about how many of those disciplines got translated into gates.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Validate the dependency graph before starting any subprocess",
+   "how": "The usual approach is to string dozens of checks into a sequential script and run until it stops; after a failure either the whole thing aborts, or the later checks keep drawing misleading conclusions on top of broken artifacts. What it does instead is write every named aggregate as an explicit dependency graph and validate that graph before spawning a single subprocess — duplicate ids, a dependency pointing at a check that doesn't exist, a cycle, all three throw on the spot. At run time it fills the concurrency slots with whatever has all its dependencies passing and advances by taking whichever finishes first; when there is nothing startable and nothing running, the remaining work items are marked skipped one by one, each noting which dependency dragged it down. The exit code treats failed and skipped the same.",
+   "why": "So that when one foundational check fails, the downstream work neither draws conclusions on broken artifacts nor disappears without a sound."
+  },
+  {
+   "name": "One flag turns the generator into the checker",
+   "how": "The usual approach is to write a separate validator for generated docs. The problem is that validating and generating are two pieces of code that evolve separately, and when they come to disagree about what the correct output is, the symptom is a false green rather than an error. What it does instead is not write the second program: the same generator takes one flag and switches to check mode — nothing written to disk, the full render run in memory, the result compared byte for byte against what's committed, every mismatching file listed with a demand to rerun the generator and commit again. Missing file, different content, even a read failure all land in the same bucket, stale, because the remedy is identical. The ten check commands that exist today are exactly the generators with that flag.",
+   "why": "Sharing one piece of rendering code makes it impossible for the two to grow different expectations."
+  },
+  {
+   "name": "Unrecognized means stopped, not waved through",
+   "how": "To check whether public exports are documented you first have to enumerate the forms: functions, classes, interfaces, type aliases, enums, constants, namespaces, re-exported aliases. The usual way is to let the dispatch chain reach the end, recognize nothing, and return — treating it as compliant. That never produces a false positive; the price is that every new form gets an automatic exemption with no signal whatsoever. What it does instead is replace that last return with a violation: this gate doesn't recognize this export form, go extend the gate. Same handling elsewhere: an inline callable type carrying a call signature mixed in with other members is rejected, since there's no single signature to hang a doc tag on, and the fix demanded is extraction into a named declaration.",
+   "why": "The gate's promise is that a public API which has never been checked cannot exist; any silently-skipping branch voids it."
+  },
+  {
+   "name": "Every package owes one sentence",
+   "how": "The usual approach is to pile every consistency assertion into one central module. Fast to write, but nobody knows which package it missed — \"who should have assertions\" was never accounted for. What it does instead is require every workspace package to have a hand-written companion module registering its own package name and an install function; the gate walks the syntax tree package by package to confirm it exists, carries no generated marker, registers its own name and not another's, and exports under the conventional name — down to checking the package manifest's export map, published file list, dependency declarations, and project references. The key clause: the install function body may be empty, but the declaration must carry a sentence with a fixed opening explaining why this package has no observable runtime relationships.",
+   "why": "A shell filled in by code generation survives the change in a package's nature, and nobody notices it has gone stale."
+  },
+  {
+   "name": "The recording is both the input and the answer",
+   "how": "The usual replay-test setup maintains two files: a fake model script fed to the system, and an expected output to compare against. The two drift, and the direction of drift is almost always that the expected output gets quietly edited to match the actual. What it does instead is let one recorded session log play both parts — on replay, each model call's script is rebuilt from the assistant chunk events by cutting at every termination marker, and afterwards the re-persisted log is compared against it line by line. Cases that can't be derived (an error thrown mid-stream, a hang waiting for cancellation) must come with an explicit supplementary file rather than letting the replayer guess an ending.",
+   "why": "It removes a separately maintained fake script and turns \"can the system rebuild its requests from its own log\" into a property verified on every test run."
+  },
+  {
+   "name": "Count at teardown: was all of the recording used?",
+   "how": "A regression like \"the refactor sends one fewer model request\" turns nothing red — every written expectation still holds, the tail of the recording just quietly goes unused, and an ordinary replayer stops there. What it does instead is one extra headcount at scenario teardown: every recorded script must have been bound to some live session, and every bound cursor must have walked its entry list to the end; either one failing throws a diagnostic with the actual numbers in it. The other direction is guarded too — when requests outnumber the script's entries, it reports the script as exhausted.",
+   "why": "One missing request is the regression most easily disguised as a pass, because it trips none of the assertions anyone wrote down."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Let the generator double as its own staleness checker; don't write a second validator.",
+   "why": "The validator and the generator evolve separately, and eventually they disagree about what the correct output is — a disagreement whose symptom is a false green, not an error. Share one piece of rendering code and fork only between writing to disk and comparing, and the disagreement can't exist. What you save isn't a program, it's a whole class of errors you would never have found."
+  },
+  {
+   "lesson": "Put a fail-closed fallback at the end of any classifying check's dispatch chain.",
+   "why": "Languages grow new syntax, codebases grow new habits. Default-pass means every new form gets an automatic exemption with no signal; default-fail means that when a new form appears, someone has to explicitly decide how to treat it, at the cost of one change extending the gate. That one line decides whether the gate can keep anything out at all."
+  },
+  {
+   "lesson": "A mandatory empty implementation must carry a package-level explanation; don't fill them in with generated placeholders.",
+   "why": "A placeholder costs nothing, so it survives long after the package's nature has changed. A sentence saying why this package has no observable runtime relationships is a reviewable claim — delete it and the gate turns red — so it gets a chance to be revisited when the package grows mutable state. What's mandatory isn't the assertion, it's the answer."
+  },
+  {
+   "lesson": "Put the replay input and the expected output in the same file.",
+   "why": "Two files drift, and the direction of drift is almost always the expected output getting quietly edited to match the actual — nobody wants to go investigate a mismatch under deadline. One persisted log playing both parts turns \"can the system rebuild its requests from its own log\" into a property verified on every test run, rather than a promise in a doc."
+  },
+  {
+   "lesson": "Encode classification in the path, not in a header field.",
+   "why": "A path is visible while traversing, so an unknown directory name or a wrong nesting depth fails at walk time; a header field can only be validated after the file has been read, and the files you can't reach are exactly the dangerous ones. Paths also make browsing the directory the listing itself, sparing you an index that needs continuous maintenance."
+  }
+ ],
+ "tradeoffs": [
+  "The \"one runtime-invariant companion module per package\" rule produced 184 explained empty implementations across 219 packages, with only 35 that actually execute. Most of the maintenance cost goes into writing and reviewing \"why this package has no invariants,\" not into checking anything. Whether that ratio is worth it depends on whether you believe silence is more dangerous than a wrong answer.",
+  "These invariant assertions aren't mounted in the product by default: the shipped command-line preset config has no registry in it. They take effect only in the global setup for unit tests and in the demo assembly used by the examples (which mounts four explicitly). Meaning the running product doesn't catch corrupted state any earlier because of them.",
+  "The docs-sync aggregate has 28 leaf checks, and full local stacks tests, snapshots, build, and hygiene on top of that. One run is expensive, and concurrency has to be held to 4 — several docs checks each build a complete type-analysis program, and letting them run wide buys an out-of-memory crash rather than a shorter wall clock.",
+  "Byte-for-byte comparison means any tweak to the render format requires rerunning every generator and committing the results alongside. Diff noise from committed generated files is the normal state, and reviewers have to consciously separate generated output from hand-written changes, or the real change gets buried.",
+  "Per-file 100% coverage needs a string of platform and environment exceptions: machines without PowerShell, modules loaded only on Windows, entry points that only run as a subprocess, a batch of uninstrumented heavy suites. The exceptions become rules of their own to maintain and justify, each having to state why excluding it leaves the threshold conclusion unchanged.",
+  "Freezing the archive permanently means that once a record is sealed, an error inside it can't be corrected — you can only write a separate note in the live area and link across. Combined with the explicit ban on a central index, finding an old decision comes down to browsing directories and searching the repo: fast for anyone who knows the category boundaries, fairly discouraging for anyone who doesn't."
+ ],
+ "codeIndex": [
+  {
+   "path": "scripts/run-gates.ts",
+   "note": "Every gate aggregate's definition, the dependency-graph validation, and the concurrency scheduling"
+  },
+  {
+   "path": "scripts/package-invariants.ts",
+   "note": "Syntax-tree and package-manifest checks for the invariant companion modules, including the explanation marker on empty implementations"
+  },
+  {
+   "path": "scripts/verify-package-invariants.ts",
+   "note": "Entry point for the package-invariant gate"
+  },
+  {
+   "path": "packages/runtime-diagnostics/invariants/src/index.ts",
+   "note": "The invariant registry service: selection, uniqueness, child-context lifecycle"
+  },
+  {
+   "path": "scripts/verify-export-jsdoc.ts",
+   "note": "The export-documentation check, including the fail-closed fallback at the end of the dispatch chain"
+  },
+  {
+   "path": "scripts/gen-doc-graphs.ts",
+   "note": "The relationship-diagram generator doubling as its own checker, including the service-classification completeness assertion"
+  },
+  {
+   "path": "packages/test-support/llm-replay/src/index.ts",
+   "note": "Deriving replay scripts from session logs, plus the teardown assertion that everything recorded was consumed"
+  },
+  {
+   "path": "packages/test-support/acp-snapshot/src/suite.ts",
+   "note": "The snapshot suite factory: the log's dual role, and pinning request headers per category"
+  }
+ ],
+ "related": [
+  "typert",
+  "session",
+  "cordis-loader",
+  "critique"
+ ]
+}

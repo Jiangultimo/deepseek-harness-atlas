@@ -1,0 +1,208 @@
+{
+ "id": "sandbox",
+ "lede": "The easiest thing to mistake for a simple job is adding a sandbox to an agent. You just stuff the command into a restricted executor and run it, right?\n\nActually build it and you find the hard part isn't \"how do I lock it down.\"\n\nIt's three other, more awkward things: how tightly you can lock anything down at all depends on this machine's kernel version; different executors need different boundaries at the same instant; and worst of all — a command exits nonzero with an error line sitting in the error output, and you have to tell on the spot whether the sandbox blocked it or the sandbox never came up. Those two look identical and mean opposite things.\n\nNearly every unusual design decision in this area was forced by those three.\n\n**The real difficulty in sandbox engineering isn't isolation. It's attribution.**",
+ "packages": [
+  "packages/sandbox/sandbox",
+  "packages/sandbox/sandbox-local",
+  "packages/sandbox/sandbox-policy",
+  "packages/sandbox/sandbox-windows-acl",
+  "packages/shell/bash-sandbox",
+  "packages/shell/tool-bash",
+  "packages/fs/fs-sandbox",
+  "packages/fs/tool-fs",
+  "packages/terminal/terminal",
+  "packages/terminal/terminal-bash",
+  "packages/lsp/lsp",
+  "packages/interaction/permission-presets"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "\"Locked down\" was never a yes-or-no question",
+   "body": [
+    "Intuitively a sandbox is a switch. On means locked down, off means not.",
+    "But land on a real host and the meaning of the same \"read-only\" drifts. On a new kernel it is fully enforced; on an older kernel interface it covers only some file effects; and on the Windows restricted-token route it can only ever cover part of them — that mechanism requires keeping the \"Everyone\" identity in the restriction list when it initializes, so anything that grants write access to Everyone stays writable.",
+    "The usual approach swallows this: the backend either succeeds or fails, and success is assumed to mean locked down. The result is a system that silently degrades on those hosts, and nobody ever finds out.",
+    "What happens here instead is that enforcement strength is pulled out as its own dimension and reported upward. Fully enforced and partially enforced are two distinct values, handed back to the caller with every wrap. Partial enforcement isn't a failure — the command still runs. But a caller that needs an absolute boundary gets the chance to refuse it right there.",
+    "The vocabulary of modes is deliberately narrow too. Three values, promising nothing beyond file effects: read-only, workspace-writable, wide open. Read-only allows just the one throwaway write sink a shell needs to run at all; workspace-writable additionally allows the workspace root and the platform temp area. Network access and process visibility are explicitly outside the promise — the backend doesn't promise them, and callers aren't allowed to infer them either.",
+    "Only the first two of the three ever reach a backend. A consumer at wide open doesn't call the sandbox at all; it launches the original command directly. In the type system these are two different policies: one admits all three values, the other excludes wide open, and only the second one can be handed to a backend.",
+    "**The bypass path and the constrained path split apart at compile time, not behind a runtime if.**",
+    "So what's worth watching here isn't what this sandbox locks down — it's what it admits it doesn't. How honest a system is about the limits of its own power decides directly whether anything above it can still exercise judgment."
+   ]
+  },
+  {
+   "heading": "It doesn't run the process for you, it swaps the command",
+   "body": [
+    "Most sandbox libraries work like this: you hand them the command and they run it for you.",
+    "Sounds convenient. The price is that it has to reimplement process management — timeouts, streaming output, signals, exit-code collection all move into the sandbox layer. And the caller already had a mature version of every one of them.",
+    "The service here does exactly one thing. To the operating system a command is just an array of strings: program name plus arguments. The caller hands over the array it was about to launch, along with this call's policy, and gets a different array back — the restricted executor, its policy arguments, a separator, and only then the original string — then launches that itself.",
+    "In other words, it doesn't do process management. Timeouts, output collection, and signal handling all stay with the caller, and the backend never needs to know how the caller intends to run the thing.",
+    "What comes back is more than the array. Three reports ride along: the enforcement strength actually achieved this time; the wording this particular backend prints to the error output when the kernel blocks a file effect; and a structured set of rules for deciding that the executor itself failed. The caller uses those to interpret how the process ended instead of guessing.",
+    "One more thing is nailed into the contract: either return an array that genuinely constrains, or fail on the spot. Quietly handing the original back — \"no sandbox on this machine, never mind then\" — is explicitly forbidden.",
+    "**It deliberately doesn't wrap process mechanics, so containers, microVMs, and remote execution don't have to masquerade as one of its backends — they replace the whole capability instead.**",
+    "The value of an abstraction often lies not in how much it covers, but in what it explicitly refuses to cover."
+   ]
+  },
+  {
+   "heading": "One misdiagnosis bought an attribution order",
+   "body": [
+    "The command finished, exited nonzero, and there's an error line in the error output. Question: did the sandbox block it, or did the sandbox never come up?",
+    "The two mean opposite things. The first says the constraint worked and the command was correctly stopped. The second says the command never ran at all, and this is an infrastructure failure. To the caller they look identical.",
+    "The usual approach matches a signature string: see a certain prefix plus a nonzero exit, call it an executor failure.",
+    "That rule caused an incident here. The launcher on older kernels prints a harmless notice line before every run, and that notice shares a prefix with the genuinely fatal line. So any nonzero exit got called an executor failure — including the perfectly normal exit code 1 that a command-line search tool returns when it finds nothing. A \"no matches\" was reported as \"sandbox unavailable.\"",
+    "The incident had a second half. The file search above it wrapped the structured \"sandbox unavailable\" thrown from below into its own blanket \"search failed.\" The caller lost the error code and got a wrong diagnosis on top of it.",
+    "The test now is a conjunction. The exit must be nonzero. If the rule declares a set of exit codes, one of them has to match (125 for the older-kernel tier, 127 for the executor on the Windows side). Known harmless notice lines are stripped by exact, case-insensitive, whole-line match. And among the lines that remain, one must contain the fatal substring. An exit code on its own is never evidence.",
+    "The order is fixed too: test for executor failure first, denial second. The executor's own diagnostic text can perfectly well contain denial wording, so testing the other way around reads an infrastructure failure as a normal block.",
+    "Then there's the class where the launch never succeeded at all. Attributing that to the sandbox takes several conditions at once: the error code is one of the two, the error path is exactly the restricted executor itself, the syscall field lines up, and — confirmed independently, first — the working directory the caller supplied exists and can be entered. An unreachable working directory produces the identical error code; without ruling it out first, the caller's own bad argument gets logged as an infrastructure failure.",
+    "**Sharing a prefix is not a protocol. Before you attribute anything from a signal, you have to prove that only the case you want to attribute it to can produce it.**",
+    "I've come to think this part is closer to detective work than to wall-building. Wrong attribution is worse than none — it points the investigation at a problem that doesn't exist."
+   ]
+  },
+  {
+   "heading": "The boundary is an argument, the log is the storage",
+   "body": [
+    "\"What's the current sandbox mode?\" — the question sounds like it should have one global answer.",
+    "In practice it doesn't. At the same instant one shell can be running read-only while a restricted subagent needs its state directory writable, and an approved widening is really just \"call again with a different policy.\"",
+    "The usual approach has the backend hold a \"current mode,\" and switching is a write to that field. Add concurrency and those scenarios either serialize or contaminate each other — and afterwards attribution points at the wrong policy.",
+    "Here the policy is an argument on every call: the mode, an absolute workspace root, and an optional session identifier. The backend holds no \"current\" anything.",
+    "Resolving that policy belongs to someone else, in three tiers of precedence: the explicit mode approved for this call beats the last mode-switch event in that session's log, which beats the deployment default. The default is read-only — letting the agent write takes an explicit opening. The workspace root comes from the session's working directory, resolved to its real path first and normalized lexically second, so a path carrying a symlink or a walk upward still lands on the directory the process actually runs in.",
+    "So where does the mode switch itself live? Nowhere separate. It is a session event, and the log is the storage. The current mode is the log folded back-to-front, taking the first hit; miss, and you get the deployment default.",
+    "**Restarts recover by replay, two sessions can't see each other by construction, and no external config store is needed anywhere. The cost is one fold per read, and that fold is a pure function.**",
+    "The event goes into the log only, never into the model's conversation history. The \"permission level\" a user sees is really this plus an approval policy, and switching levels writes both events separately.",
+    "But the model does have to know where it can write. So the policy owner also injects a passage into the system prompt describing the current mode and the workspace path — and pointedly does not enumerate which tools are available. It describes the policy, not an inventory of capabilities. That passage is recorded with the request's context snapshot, so a replay rebuilds the same model input.",
+    "When state has to survive a restart, look first at whether an existing event stream can hold it. One more store is one more truth to keep in sync."
+   ]
+  },
+  {
+   "heading": "The turn after hitting the wall is the hard one to design",
+   "body": [
+    "What happens after the model hits the boundary?",
+    "The lazy answer is to error out and make a human edit the config and start over. The price is that every boundary drawn a little too tight turns into a restart that loses all the context.",
+    "The other extreme lets the model widen the boundary itself. That costs more — it amounts to having no boundary.",
+    "Honestly, widening is the easiest path to get wrong. The approach here: the model may request one widening within the same turn, but the request has to clear a series of gates first, and only after all of them does anything execute.",
+    "The model can see only two targets (read-only is the floor; nobody widens toward it), a globally fixed enumeration in the registry. Whether this particular request is strictly wider, though, gets checked at execution time against the effective mode for this call — the enumeration is a global fact, the effective mode is a per-call fact, and the two must not be mixed.",
+    "The checks are ordered and fail closed: strictly wider first, then whether an approval channel exists, then whether there's an executor to attribute it to, and only then does a human's answer map onto four outcomes — allow once, deny, cancel, or no answer possible. Any missing link throws its own fixed wording, which the tool layer turns into an error result for that call.",
+    "A request that isn't a widening never bothers the user at all.",
+    "One small rule on top: a widening request must carry a reason written for a human, and a reason with no request attached counts as malformed too. What lands in the approval record is \"widen the sandbox to this level: reason\" — self-contained, so an audit later doesn't have to go back for context.",
+    "**Every failure path sits before execution. A call that gets denied never ran a single command.**",
+    "The command-execution tools and the file-writing tools share one vocabulary and one set of phrasings, so the denial the model sees is the same sentence either way. It doesn't have to learn \"which tool turned me down\" twice."
+   ]
+  },
+  {
+   "heading": "Not every wall is worth building out of kernel",
+   "body": [
+    "Or push it one step further: not every place that needs isolation is worth spending the kernel on.",
+    "Command execution really does go through the kernel: the whole command is handed over to be wrapped, and what comes back is what gets launched. The price is that the only way to tell whether something was denied is to read it back out of the error output — so denial wording has to be matched against the dialect of whichever backend is currently selected, never the union of all of them. bubblewrap says read-only file system, Landlock says permission denied, Seatbelt says operation not permitted. Take the union and you'll claim a denial the selected backend could never produce.",
+    "The file-writing tools use an in-process fence instead: in writable mode the target path is re-normalized right before anything happens, checked for landing inside a writable root, and then that freshly resolved target is what goes down to the write. The thing checked and the thing written are the same thing; there's no \"check here, write there.\" When it denies, it throws a structured error code, so nothing has to be worked back out of text.",
+    "Worth noting: the code is blunt about what it is. This is a policy check inside trusted code, not a kernel boundary. It doesn't pretend otherwise.",
+    "Both routes derive their writable roots from the same place — workspace root, system temp directory, platform user temp directory, normalized and deduplicated — so you never get the drift where a command can write to temp and the file-writing tool can't.",
+    "Persistent terminals are a third case: a pseudo-terminal is constrained once, at the moment it starts, and then lives for a long time. So a fence sits on the dispatch path for session events — as long as this owner still has a live or in-flight terminal, a mode-switch event is refused. Terminal access control doesn't look at the identifier string either; it looks at whether the owner object is strictly the same object, so another executor holding the identifier still can't read from it or write to it.",
+    "Language services are a fourth case, narrowed in a completely different way: no process constraint at all. Instead the interface is shrunk down to four semantic operations — go to definition, find references, go to implementation, hover. It's a closed set, with no protocol passthrough of any kind and no process or document control exposed. Adding an operation means compiling in three places at once: the service, the backend, and the tool.",
+    "**When the attack surface is small enough to enumerate, enumerating it beats wrapping another sandbox around it.**",
+    "Isolation isn't a technique, it's a set of trade-offs. When to spend kernel and when to spend interface is itself a design decision, not a measure of skill."
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Hand in one command, get a different command back",
+   "how": "The usual sandbox library takes your command and runs it, which means it has to reimplement timeouts, streaming output, and signal handling. Here there is exactly one action: the caller hands over the \"program name plus arguments\" array it was about to launch, along with this call's policy, and gets back a replacement array — the restricted executor, its policy arguments, a separator, and only then the original string — then launches it itself. Process mechanics, timeouts, and output collection stay with the caller, and the backend never needs to know how it plans to run. Three reports come back with the array: the enforcement strength achieved this time, the wording that backend prints when it is blocked, and structured rules for deciding the executor itself failed. The contract explicitly forbids quietly handing the original back.",
+   "why": "Separating \"how to constrain\" from \"how to run a process\" means containers, microVMs, and remote execution don't have to masquerade as a backend here — they replace the whole capability."
+  },
+  {
+   "name": "Line the candidates up by platform, then make one prove itself",
+   "how": "The usual approach either probes every backend at startup or relies entirely on configuration. Here a candidate chain comes from the platform first: on Linux bubblewrap leads (its mount policy sits closest to the mode vocabulary), falling back to the Landlock launcher; macOS has only Seatbelt; Windows has only the restricted-token executor. A chain of length one is selected outright, with no probe; only a chain longer than one runs an ordered capability probe — actually running an empty command under the read-only policy, and counting it available only on exit 0. The conclusion is computed once per backend-instance lifetime and cached. A platform with no chain fails immediately the first time a constraint is needed.",
+   "why": "Probing exists to arbitrate between competitors; probing the only candidate again just adds startup cost, and its refusal at execution time was already the backstop."
+  },
+  {
+   "name": "Each backend speaks only its own denial dialect",
+   "how": "The usual approach strings every known denial message into one big list and matches down it. The problem is that the wording each backend prints when the kernel blocks it is entirely different: a read-only bind mount reports read-only file system, Landlock reports permission denied, Seatbelt reports operation not permitted, and the Windows side has three more spellings of its own. Take the union and you'll claim a denial the selected backend could never produce, misreading an ordinary command failure as a policy refusal. What happens here is that the dialect of the currently selected backend rides along with every wrap and is handed to the caller, who matches against that set and nothing else.",
+   "why": "Get the denial test wrong and the model goes off to request a widening it never needed, while the real cause of the failure is lost."
+  },
+  {
+   "name": "Concluding the sandbox never came up takes several pieces of evidence at once",
+   "how": "The usual approach sees a signature prefix plus a nonzero exit and calls it an executor failure. Here it is a conjunction: the exit must be nonzero; if the rule declares a set of exit codes, one has to match; known harmless notice lines are stripped by exact, case-insensitive, whole-line match; and among the remaining lines one must contain the fatal substring, with the matching line kept verbatim as error detail. The class where the launch itself failed has its own conditions: the error code is one of the two, the error path is strictly the restricted executor, the syscall field lines up, and the working directory the caller gave has been independently confirmed to exist and be enterable. Any one of these missing, and it is rethrown as an ordinary executor error rather than claimed.",
+   "why": "The launcher on older kernels prints a harmless notice before every run, sharing its prefix with the fatal line; on prefix-plus-any-nonzero-exit alone, the exit code 1 from a search that found nothing gets reported as sandbox unavailable."
+  },
+  {
+   "name": "The boundary travels with the call, the mode travels with the log",
+   "how": "The usual approach has the backend hold a \"current mode,\" and switching is a write to that field — add concurrency and they contaminate each other. Here the policy is an argument on every call: mode, absolute workspace root, and an optional session identifier (a backend may keep per-session state under it, and falls back to per-call when it is absent). Resolution belongs elsewhere, in three tiers: the explicit mode approved for this call beats the last mode event in that session's log, which beats the deployment default, and the default is read-only. The mode switch itself opens no store of its own — it is a session event, and reading it is a pure function that folds the log back-to-front and takes the first hit. The workspace root comes from the session working directory, resolved to its real path first and normalized lexically second.",
+   "why": "Two executors can demand different boundaries at the same instant; restarts recover by replay with no catch-up logic, and two sessions can't see each other's overrides by construction."
+  },
+  {
+   "name": "A widening clears every gate before anything runs",
+   "how": "The usual approach errors out and makes a human edit the config and start over, or else just lets the model turn the dial itself. Here the model can request one widening within the same turn, but the checks are ordered and fail closed: verify the target mode is strictly wider than the effective mode for this call, then require an approval channel, then require an executor to attribute it to, and only then map the human's answer onto four outcomes — allow once, deny, cancel, or no channel. Every outcome but allow throws its own fixed wording, which the tool layer turns into an error result for that call. Request and reason must appear together, and the reason can't be blank.",
+   "why": "A request that isn't a widening never pops a prompt at the user at all; every failure path sits before execution, so a denied call never ran a single command."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Make enforcement strength a reported fact, not an assumed premise.",
+   "why": "The same mode is fully enforced on a new kernel and only partially enforced on an older interface or a Windows restricted token. Pass it up as part of the return value and a caller that needs an absolute boundary at least gets to refuse; a system that assumes full enforcement silently degrades on those hosts, and nobody ever finds out."
+  },
+  {
+   "lesson": "Attributing a process outcome takes a conjunction of independent evidence — a shared prefix is not a protocol.",
+   "why": "In the incident, the harmless notice line and the fatal line shared a prefix, and pairing that with \"any nonzero exit\" produced an executor failure, so the exit code 1 from a search that found nothing was reported as sandbox unavailable. The test now demands the exit-code gate, whole-line exact stripping of notice lines, and a per-line match on the fatal substring, all three at once."
+  },
+  {
+   "lesson": "An adapter should pass a lower layer's structured error straight through, not swap it for the nearest generic one it owns.",
+   "why": "The second half of the same incident: file search wrapped the structured \"sandbox unavailable\" thrown from below into its own blanket \"search failed,\" and the caller lost the error code and got a wrong diagnosis besides. Once a coded error is eaten, nothing above it can tell an infrastructure failure from a task failure."
+  },
+  {
+   "lesson": "Anything that can differ per call belongs in an argument, not in backend state.",
+   "why": "At the same instant one executor can be running read-only while another needs its state directory writable, and an approved widening is just another call with a different policy. Once the backend holds a \"current mode,\" those scenarios either serialize or contaminate each other, and attribution under concurrency points at the wrong policy."
+  },
+  {
+   "lesson": "Narrowing an interface is itself a form of isolation; not every capability has to be constrained by the kernel.",
+   "why": "The language-service side does no process constraint at all — four semantic queries, no protocol passthrough left open, and adding an operation means compiling in three places; persistent terminals authorize on owner object identity rather than a guessable identifier. When the attack surface is small enough to enumerate, enumerating it beats wrapping another sandbox around it."
+  }
+ ],
+ "tradeoffs": [
+  "The mode vocabulary covers file effects only. Network access and process visibility are outside the promise, so a deployment that needs either has to replace the whole capability — container, microVM, or remote execution — rather than swap in a different backend. The line is drawn clearly, but it does put a lot of what people assume a sandbox handles on the far side of it.",
+  "The error output is an in-band attribution channel. A constrained child process is perfectly free to print the executor's fatal line on purpose and pick that exit code, manufacturing a false \"sandbox unavailable.\" The tightened conjunction only blocks accidental collisions; it doesn't authenticate the writer. This is a usability and diagnostics problem, not a jailbreak — but it does show the channel is dirty by nature.",
+  "The file tools' fence is a policy check inside trusted code, not a kernel boundary. A residual window remains between re-normalization and the actual write, and a symlink on an ancestor directory can be swapped inside it. This is documented and accepted, on the grounds that what's untrusted is the path and not the code — the reasoning holds, but it's a premise, not a guarantee.",
+  "The Windows route always reports partial enforcement: restricted-token initialization requires keeping the \"Everyone\" identity in the restriction list, so anything granting write access to Everyone stays writable, and hard links can alias a file inside the workspace to somewhere outside it. This isn't an unfinished implementation, it's the ceiling of that technical route.",
+  "The workspace access-control entry is never revoked once established — it's a cache reused across sessions. An abnormal exit also leaves private temp directories behind. A new backend instance won't reuse the leftover random paths and identifiers, so this isn't a privilege leak, but reclamation depends on the system's own temp cleanup.",
+  "Single-candidate platforms aren't probed. Backend selection on macOS and Windows gets no startup verification; the only backstop is a refusal on the first real execution. What's saved is startup cost, what's paid is that problems surface later. Separately, a few backends can only be judged failed by their error-output signature, because their public contract reserves no failure status code."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/sandbox/sandbox/src/index.ts",
+   "note": "The service contract: mode vocabulary, the three reports in a wrap result, and the fail-closed error codes"
+  },
+  {
+   "path": "packages/sandbox/sandbox/src/escalation.ts",
+   "note": "Widening target table, the paired request-and-reason validation, ordered approval, and every fixed phrasing"
+  },
+  {
+   "path": "packages/sandbox/sandbox/src/roots.ts",
+   "note": "The single derivation of writable roots and path normalization, shared by the command route and the file route"
+  },
+  {
+   "path": "packages/sandbox/sandbox-local/src/index.ts",
+   "note": "Platform candidate chain, capability probe, denial dialect table, executor-failure rule table, Windows authorization"
+  },
+  {
+   "path": "packages/sandbox/sandbox-local/src/profiles.ts",
+   "note": "The differing spellings across the bwrap, Landlock, and Seatbelt profiles"
+  },
+  {
+   "path": "packages/sandbox/sandbox-policy/src/index.ts",
+   "note": "Three-tier precedence resolution, workspace-root fallback, and injecting the current policy into the system prompt"
+  },
+  {
+   "path": "packages/shell/bash-sandbox/src/helpers.ts",
+   "note": "The classifier splitting executor failure from command denial, including the conjunction for attributing pre-launch failures"
+  },
+  {
+   "path": "packages/terminal/terminal-bash/src/index.ts",
+   "note": "The fence that refuses mode-switch events while a pseudo-terminal is alive"
+  }
+ ],
+ "related": [
+  "shell",
+  "fs",
+  "session",
+  "engineering"
+ ]
+}

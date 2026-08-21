@@ -1,0 +1,211 @@
+{
+ "id": "llm",
+ "lede": "Wiring up a large model looks like the least design-intensive job in the whole system: send the request, read the stream back line by line, done.\n\nThen you actually do it, and the trouble turns out to be somewhere else entirely. One vendor throws when a call fails; another never throws — an error event surfaces in its own event stream, and then the stream ends \"normally.\" The model hits its length ceiling halfway through, and you're left holding half of a tool call's arguments. The user just switched models, at the exact moment a request was parked waiting on the answer to \"what can this model do?\"\n\nNone of this is a question about how to send an HTTP request.\n\nWhat's worth watching here isn't how the request goes out — it's the full shape of a model call's life.\n\n**What the model seam has to define is how a call starts, how it ends, and whether that ending counts.**",
+ "packages": [
+  "packages/llm/llm",
+  "packages/llm/llm-deepseek",
+  "packages/llm/llm-pi-ai",
+  "packages/llm/llm-retry",
+  "packages/test-support/llm-replay"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "A call gets exactly one way to die",
+   "body": [
+    "Two adapters with completely different temperaments hang off the same seam.",
+    "The direct one is hand-written request logic: when something goes wrong, it throws. The other is built on a third-party library, and it never throws — an error event surfaces in its event stream, and then the stream ends.",
+    "The usual approach is to let each go its own way: what throws propagates up, what emits an event passes through untouched, and every consumer adapts on its own. But that means the main loop, the session log, context compaction, subagents — every single consumer has to write both a catch and an error branch.",
+    "Two paths coexisting means sooner or later someone writes only one.",
+    "Honestly, I've seen this too many times: the first version covers only the throwing path, and the other one gets remembered when some vendor actually breaks.",
+    "What it does instead is push normalization into the last meter before the crossing. Outward, only one terminal form is admitted: the stream always ends with a terminal chunk carrying a reason tag — stopped normally, stopped to call a tool, hit the output ceiling, cancelled, failed. The last two carry an extra serializable record of the failure: a human-readable message, a stable machine code, the HTTP status, the vendor's suggested wait, the request id.",
+    "So route selection, capability resolution, and building the iterator all sit inside the guarded region, and anything that throws turns on the spot into \"emit a terminal chunk, then end.\" Cancelled or failed is decided by exactly two things: whether the caller's cancellation signal fired, and whether the failure code is \"cancelled.\"",
+    "But one statement is deliberately left outside the guard: the one that hands the chunk out.",
+    "Because an error thrown back after downstream has the chunk — middleware blew up, the consumer blew up, cleanup blew up — is not a failure of the model call at all. Wrapping it into a well-formed terminal chunk is putting words in the model's mouth.",
+    "**Normalization should be cut along whose failure this is, not along where it was thrown from.**",
+    "Once this layer holds, the main loop's logic gets absurdly short: write each chunk to the log in order, feed it to the assembler, and read the terminal reason once the stream ends. Only failure and cancellation go through recovery; everything else just writes an assistant message."
+   ]
+  },
+  {
+   "heading": "Reading what someone else threw at you",
+   "body": [
+    "Turning a thrown thing into that record of the failure looks like two lines of code: read its code, read its message.",
+    "That holds for your own error objects. But the thing thrown at you might be a same-named copy from another package, might be a third-party library's own error class, or might not be an error object at all — a string, a number, a proxy nobody has ever seen before.",
+    "The fields on such an object may not be data at all — they may be accessors. \"Reading\" one is actually running someone else's code. It can throw, it can return a different value each time, and it can quietly change something else while you read.",
+    "A normalizer blown up by the very input it was normalizing is the hardest kind of failure to track down.",
+    "The usual approach is to wrap it in a catch and call it a day. This goes further: it never reads a field directly. It fetches the property descriptor first, and takes the value only if the descriptor actually holds one — proof that this is an honest data property. Even fetching the descriptor happens inside the guard, because a proxy can lay an ambush right there.",
+    "If the thrown thing carries a complete failure record of its own, it still has to pass a cross-check: the record is trusted as a whole only when the code inside it matches the code on the error object itself, exactly. The reasoning isn't hard — copying across packages preserves the data but not the class identity, and two independent fields agreeing is what tells you this really came from this system rather than a name collision.",
+    "The fields get checked one by one too: the status code must be an integer from 100 to 599, the suggested delay must be a positive finite number, the request id must be non-empty. One item fails and the whole record is void.",
+    "If the check doesn't pass, only the message and the code survive — and the code is trusted only from this system's own error classes. A code from a third-party library is always recorded as \"unknown\": it isn't our taxonomy, and letting it in only poisons downstream routing decisions.",
+    "**Once an object crosses a package boundary, all it has left is shape, not identity. Every inference of the form \"this looks like one of ours\" stops holding here.**"
+   ]
+  },
+  {
+   "heading": "The fragments have to reassemble into one message",
+   "body": [
+    "Things in a streaming response arrive interleaved.",
+    "Reasoning content, body text, and the arguments of several parallel tool calls all come mixed together, a fragment at a time, each fragment carrying only a block index telling you which block it belongs to.",
+    "The usual approach is to append in order: a fragment arrives, you glue it on. That's fine when there's only body text; the moment the model opens three tool calls at once, what you glue together is three sets of arguments smeared into one blob of JSON.",
+    "The assembler uses a table keyed by index plus an array recording first-appearance order: accumulate separately by index, emit in the order each index first showed up.",
+    "It also deliberately doesn't require the protocol to send a \"block start\" event. When a delta arrives and there's nothing in progress under that index yet, one is created on the spot from the delta's type and its order registered. That lets a crude protocol that sends only deltas and no start events still be caught.",
+    "What's worth watching here isn't how it glues things together — it's when it stops. Once a block-end event has written the complete block, that slot freezes. Later deltas at the same index are ignored, and so are repeated closes.",
+    "The first close wins.",
+    "That one rule buys two things at once. What the user watched stream across the screen and the message that finally lands in the session log won't tell different stories; and a misbehaving adapter can't blow up memory by reopening a block over and over, or quietly rewrite a result that was already shown.",
+    "There's one more trim at the content level: when the terminal reason is \"hit the output ceiling,\" every tool call in the output is dropped wholesale. Truncated arguments are incomplete JSON, and handing them to an executor isn't best-effort — it's unsafe.",
+    "**The streaming UI and the durable record are two views of the same fact. Allow them to disagree and every later argument about what the model actually said has no referee.**"
+   ]
+  },
+  {
+   "heading": "Whoever decided for you, write it down",
+   "body": [
+    "The parameters that go into a request aren't all the caller's to decide.",
+    "How much this model can output at most, whether it supports graded reasoning effort, how many grades — that's the adapter's knowledge. The runtime has to ask \"what can this model actually do?\" first, then decide what to send.",
+    "Asking that question is async.",
+    "And during that wait, a hot reload can perfectly well swap the adapter under a vendor route for a different implementation. When the capability answer comes back, you're holding A's capabilities, about to send to B.",
+    "The usual approach is to look the registry up again at the moment the request actually goes out. That doesn't solve anything; it just moves the mismatch somewhere else.",
+    "What it does instead is a single-use handle: the prepare step pulls the current registration out whole — the adapter instance, the display info, the retry policy captured at the moment of registration — resolves capabilities with it, materializes the defaults, and returns the result frozen together with a dispatch entry that can be used exactly once.",
+    "Dispatch checks two things: whether the entry has been used, and whether the request's parameters still match the frozen ones field by field. Either one fails and it refuses outright.",
+    "In other words, it doesn't lower the odds of a mismatch — it makes a mismatch unable to take effect quietly.",
+    "The same idea shows up in the connection facts: the endpoint and the key are re-resolved on every request, so a settings change takes effect on the next one; but a stream already in flight uses, start to finish, the set of facts from the moment it began, and the key comes from that same snapshot — no \"new endpoint with the old key.\"",
+    "The handle also carries something easy to overlook: a per-field mark recording whether reasoning effort and the output ceiling came from the user, or were materialized on their behalf by the adapter.",
+    "It gets written into the session log along with the request header. When the next turn builds a request, the loop seeds it with the previous header but uses those marks to delete exactly the marked fields, then lets the plugins propose them again.",
+    "**Store only the final value and you can never tell a choice from a derivation. The moment you switch models, the previous model's default transforms itself into the user's explicit configuration.**"
+   ]
+  },
+  {
+   "heading": "Retry is a judgment, not a loop",
+   "body": [
+    "\"If it fails, retry\" sounds like a one-line job.",
+    "The hard part is answering a different question: for this failure, is retrying worth anything?",
+    "A drained balance often comes back as a 429. Back off and retry it as if it were rate limiting and every second you wait is wasted — that's a terminal failure, and ten thousand retries end the same way.",
+    "In other words, retry is first a classification and only then a loop. And the classification here is split into three layers.",
+    "The bottom is the protocol layer. The direct adapter maps HTTP statuses to stable machine codes: 401 and 403 are authentication, 429 is rate limiting, 400 splits further into \"context overflowed\" and \"ordinary bad request,\" 5xx is server-side. Both spellings of the vendor's suggested wait are accepted — a bare number counts as seconds, anything else is read as an HTTP date and differenced — and only positive finite values get through.",
+    "The middle is a text classifier, kept in the shared layer for every adapter to reuse. Two sets of regexes recognize the various phrasings of \"context window exceeded\" and \"quota exhausted.\" The order of the checks matters: the quota check has to come before the rate-limit one, or that 429 gets misfiled.",
+    "The adapter built on the third-party library leans on this layer especially hard — it never gets a structured code, only a piece of error text. Its own classifier recognizes one extra case: a stream that cut off before the terminal event, which counts as transport-level truncation, not a model-level error.",
+    "The top is policy. Every vendor route carries a retry policy resolved at the moment it was registered, and the default set is quite restrained: only five transient codes are retried — empty response, rate limit, server error, timeout, transport failure — at most twice, starting at a 500 ms wait, capped at 10 seconds, with ten percent of jitter either way.",
+    "\"Malformed credential\" is deliberately excluded. It fails the exact same way every time; retrying just commits the same error a few more times.",
+    "One more piece I find genuinely well-made: the retry count doesn't live in memory.",
+    "It's read back out of the session log — the most recent retry event with the same turn, the same step, the same route, and the same policy fingerprint. Change the policy and the fingerprint changes, so the count starts over. Each retry writes an event first, then enters a cancellable wait, then writes a start event on waking; that order guarantees that after the process dies, you can still tell from the log whether that wait ever happened.",
+    "**State that has to survive recovery shouldn't live only in process memory. A retry count looks like the runtime's private business; it's really part of the facts of this session.**"
+   ]
+  },
+  {
+   "heading": "Run the whole application without a key",
+   "body": [
+    "What snapshot testing wants is a little greedy: on a machine with no keys at all, run the entire application end to end, then compare the final output word for word.",
+    "The usual approach is stubbing: hang a canned response off some interface. The problem is that whatever layer the stub sits at, everything above it goes untested — and that fake data has to be maintained separately, so it drifts away from real behavior fast.",
+    "The choice here: the script is derived from the product's own durable log.",
+    "Record one real run, and the session log already holds every streamed chunk the model produced, chunk by chunk. A test plugin reads that log and cuts at every terminal chunk; a change of turn or step also counts as the previous call never having terminated. What falls out of the cuts is the replay script.",
+    "The design has a side effect I like a lot: recording needs no extra instrumentation, because the log has to be written anyway; and the log's reconstructability is continuously tested, because the moment something is missing from it, the replay can't be assembled at all.",
+    "When it can't be assembled, it doesn't guess. If a call didn't end with a terminal chunk, the stream really did throw back then, and the log doesn't hold that fact — so the derivation step errors out and demands that the scenario declare it explicitly in a sidecar file. The sidecar can replace the script wholesale, or patch it by call index, which is how you say \"the third turn errors, everything else as recorded.\" It can also express two forms the log simply cannot hold: emit a few chunks and then throw, and emit one chunk and then hang waiting to be cancelled.",
+    "One last thing is worth clearing up, because it's easily mistaken for part of the replay machinery.",
+    "A terminal chunk can carry a private, JSON-serializable piece of adapter state. It has nothing whatsoever to do with replay testing — it's for the next turn: the adapter built on the third-party library uses it to keep reasoning signatures, response ids, stop reasons, the kind of thing this system's own content blocks can't hold. When the next turn rebuilds the vendor's native message, it also checks type and count against this system's content, block by block.",
+    "The runtime has one guard around it: before sending a request, it walks the history, and for any assistant message whose original vendor doesn't belong to the current adapter instance, it strips that private state off before sending.",
+    "Feed one vendor's private signature to another and, at best, it gets rejected; at worst, it's swallowed whole as trusted content.",
+    "**A test double should grow out of the product's own records. Anywhere you have to maintain a separate \"fake fact,\" that fake fact will eventually become the one fact nobody ever verified.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Twisting two failures into one",
+   "how": "The usual approach is to let each go its own way: what throws propagates up, what emits an error event passes through untouched, and every consumer adapts on its own. Here the two get twisted into one in the last layer before the seam is crossed: route selection, capability resolution, and building the iterator all sit inside the guarded region, and anything that throws turns on the spot into emitting a terminal chunk and ending; a throw from the iterator inside the pull loop becomes a terminal chunk the same way. Cancelled or failed is decided by whether the caller's cancellation signal fired and whether the failure code is \"cancelled.\" Only the statement that hands the chunk out stays outside the guard — an error thrown back after downstream has the chunk is not the model's failure and must keep throwing.",
+   "why": "The layer above judges a single tag instead of maintaining both an exception path and an error-chunk path; with two coexisting, sooner or later someone writes only one."
+  },
+  {
+   "name": "Only data properties, never accessors",
+   "how": "The usual approach is to read the code and message straight off the other object and wrap the whole thing in a catch. Here nothing is read directly: the property descriptor comes first, and the value is taken only if the descriptor actually holds one — proof it's an honest data property and not an accessor. Even fetching the descriptor happens inside the guard, because a proxy can lay an ambush right there. A failure record the object brings along still has to pass a cross-check: the code inside it must match the code on the error object itself exactly before the whole record is trusted. Then the fields get range-checked one by one: the status code is limited to an integer from 100 to 599, the delay must be a positive finite number, the id must be non-empty.",
+   "why": "Cross-package copies and third-party libraries may define those fields as accessors that throw or change value; reading one is running someone else's code."
+  },
+  {
+   "name": "Slots by index, first close wins",
+   "how": "The usual approach appends in arrival order, and the moment the model opens several tool calls at once the arguments smear together. Here a table maps block index to work in progress, alongside an array recording first-appearance order: accumulate separately by index, emit in the order each index first showed up. It also doesn't require the protocol to send a \"block start\" event: when a delta arrives with nothing in progress under that index, one is created on the spot from the delta's type and its order registered. Once a block-end event has written the complete block, the slot freezes, and later deltas at the same index and repeated closes are ignored. When the terminal reason is hitting the output ceiling, the tool calls in the output are dropped wholesale.",
+   "why": "First close wins guarantees that what streamed on screen and what got stored are the same thing; truncated arguments are incomplete JSON, and executing them is unsafe."
+  },
+  {
+   "name": "Nailing one call to one registration",
+   "how": "The usual approach is to look the registry up again when you need it. The problem is that asking \"what can this model do\" is async, and during the wait a hot reload can swap the adapter under that route for a different implementation — so A's capabilities end up configuring a call to B. Here it becomes a single-use handle: the prepare step pulls the current registration out whole — the adapter instance, the display info, the retry policy captured at the moment of registration — resolves capabilities with it, materializes the defaults, and returns the result frozen together with a dispatch entry usable exactly once. Dispatch checks that the entry hasn't been used and that the parameters haven't changed field by field; either one fails and it refuses outright.",
+   "why": "A mismatch turns from a silent bleed-through into an explicit failure."
+  },
+  {
+   "name": "Marking which values the system filled in for you",
+   "how": "The usual approach is to store the resolved final parameters and copy them forward next turn. Here a per-field mark is stored alongside them, recording whether reasoning effort and the output ceiling came from the caller or were materialized on their behalf by the adapter. The marks are written into the session log along with the request header. The next turn seeds its request with the previous header, then uses those marks to delete exactly the marked fields and hands them back to the plugin chain to be proposed and resolved again. Values the user gave explicitly carry no mark and survive untouched.",
+   "why": "When you switch models, the previous model's defaults must not be inherited as the user's explicit choice."
+  },
+  {
+   "name": "Swapping a whole route set at once",
+   "how": "The usual approach is to unregister the old set and then register the new one. For that one instant the route set is empty, and anything watching topology changes sees the vendor disappear and come back, and reacts accordingly — refreshing the interface, clearing the selection, reporting it unavailable. Registration here returns more than an unregister handle: it also returns a replace entry. That entry validates the whole candidate set first — duplicate names, illegal names, and bad metadata all throw on the spot and leave the current state alone — and then, in one synchronous stretch, removes and adds without yielding in between. Calling replace on a registration that has already been unregistered is refused.",
+   "why": "No intermediate state, no observable gap."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "A boundary exposes exactly one failure form outward, and normalization is written before the crossing.",
+   "why": "Inside, you can both throw and emit error events, but as soon as both leak out, every downstream has to write two paths, and sooner or later someone misses one. Push normalization to just before the result is produced and downstream only has to judge a single tag. The thing to watch is not over-normalizing — an error thrown back by downstream itself is not the model's failure, and wrapping it into a terminal chunk is putting words in the model's mouth."
+  },
+  {
+   "lesson": "When reading an object of unknown origin, take data properties only and never touch accessors.",
+   "why": "A same-named copy from another package, or a third-party library, may define those fields as accessors, so \"reading\" one is running someone else's code: it can throw, it can return a different value each time. A normalizer blown up by the very input it was normalizing is the hardest kind of failure to track down. Fetch the descriptor first, accept only the kind that carries a value, and keep the uncertainty outside the normalizer."
+  },
+  {
+   "lesson": "Bind async resolution to the final dispatch with a single-use handle; don't rely on looking it up again.",
+   "why": "The registry can be rewritten by a hot reload while you're resolving, so a second lookup finds a different implementation — and that mismatch doesn't raise anything, it just quietly takes effect. Freeze that registration together with the resolution result into a handle usable once, verify at dispatch that the parameters haven't changed field by field, and the mismatch turns from a silent bleed-through into an explicit refusal."
+  },
+  {
+   "lesson": "Recording which values the system filled in for the user is far more useful than recording the values alone.",
+   "why": "Store only the final value and the next turn can't tell a choice from a derivation. The moment you switch models, the previous model's default transforms itself into the user's explicit configuration, and nothing anywhere raises a complaint. Per-field marks let the next turn strip derived values precisely and keep explicit ones untouched."
+  },
+  {
+   "lesson": "The source of truth for a test double should be the product's own durable log.",
+   "why": "Deriving the script from the log means recording needs no extra instrumentation, and it means the log's reconstructability is continuously tested — if something is missing from the log, the replay can't be assembled. More importantly, the cases the log can't express error out at the derivation step and force you to declare them explicitly, instead of quietly replaying as something else."
+  }
+ ],
+ "tradeoffs": [
+  "Failure classification leans heavily on regexes matching vendor phrasing: context overflow, quota exhaustion, and transport truncation are all decided from text. One copy change at the vendor and a terminal failure can be misread as retryable, or the reverse. The adapter built on the third-party library takes the worst of it — it never even gets a structured code, only a piece of message text.",
+  "The assembler silently ignores malformed streams: repeated closes and deltas arriving after a close are dropped without complaint. Syntax checking of the stream protocol lives in a separate invariant plugin; leave it out of the assembly and a misbehaving adapter will just quietly drop data, giving you no signal at all.",
+  "The defaults an adapter can materialize cover only two fields. Adding a third means changing the call parameter type, the marks in the prepare result, the persistence and comparison of the session request header, and the loop logic that strips marked fields — miss one of the four and defaults start sticking across models.",
+  "A single-use handle means every retry has to rebuild the request, which means running capability resolution again. For adapter implementations that need a network request to answer the capability question, the retry path picks up one more call that can fail.",
+  "In the normal mode, once the vendor's suggested wait exceeds the configured cap, retrying is abandoned outright. That treats \"the vendor explicitly said to wait longer\" as non-retryable — semantically closer to a conservative timeout than to honoring the vendor's advice.",
+  "Every streamed chunk writes an event to the session log, so the log grows on the same order as the tokens generated. That's the precondition for deriving replay scripts from the log, and it's this design's openly priced cost."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/llm/llm/src/index.ts",
+   "note": "The runtime proper: registry, plugin chain, call preparation, terminal normalization"
+  },
+  {
+   "path": "packages/llm/llm/src/types.ts",
+   "note": "Streaming chunk protocol, failure records, and the vocabulary for requests and model metadata"
+  },
+  {
+   "path": "packages/llm/llm/src/assembler.ts",
+   "note": "Reassembles interleaved deltas into a complete message by block index"
+  },
+  {
+   "path": "packages/llm/llm/src/adapter-failure.ts",
+   "note": "Normalizes foreign thrown values through property descriptors"
+  },
+  {
+   "path": "packages/llm/llm/src/retry-policy.ts",
+   "note": "Validation, defaults, and immutable resolution of retry policy"
+  },
+  {
+   "path": "packages/llm/llm-deepseek/src/adapter.ts",
+   "note": "The direct adapter, its HTTP error code mapping, and the idle watchdog"
+  },
+  {
+   "path": "packages/llm/llm-retry/src/index.ts",
+   "note": "Runs backoff and retry counting on the request-failure extension point"
+  },
+  {
+   "path": "packages/test-support/llm-replay/src/index.ts",
+   "note": "Derives keyless replay scripts from the session log"
+  }
+ ],
+ "related": [
+  "agent-loop",
+  "session",
+  "cordis-core",
+  "compaction"
+ ]
+}

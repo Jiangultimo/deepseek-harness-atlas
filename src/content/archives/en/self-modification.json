@@ -1,0 +1,215 @@
+{
+ "id": "self-modification",
+ "lede": "Once an agent is running, the tools it can use are fixed. Want to add one? You edit a file in the repo, restart the process, and the session starts from scratch — the half hour of context you built up with it, gone.\n\nWhat this part does sounds a bit like a joke: let the model hang plugins into its own running process. No restart, nothing written to disk.\n\nBut what's worth watching here isn't whether the model can write a plugin — it's been able to do that for a while — it's what happens after it writes a broken one. Syntax blows up, registration half-finishes, a listener throws once a second, something reaches for what it shouldn't. **The system still has to stay on its feet, and it has to tell the model which line to fix next.**",
+ "packages": [
+  "packages/extensions/cordis-host-runner",
+  "packages/extensions/tool-cordis",
+  "packages/extensions/cordis-client-runner"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "A failed update shouldn't destroy the way back",
+   "body": [
+    "The hard part of hot-swapping is never getting something installed — it's what to do when the install breaks.",
+    "The usual approach is to overwrite in place, one version replacing another. On a filesystem that's simply how things work: you save once, the old content is gone. Move it into a running process and the consequences change completely — one failed update takes out both the copy that was serving and the copy you wanted to fall back to.",
+    "What it does instead is split \"a plugin\" into three layers of identity.",
+    "- A stable identity that can evolve over the long run. The model submits only a three-to-six-letter lowercase semantic prefix; the host assigns the suffix — the model doesn't get to invent its own IDs, so nothing collides.",
+    "- Versions are immutable. Changing the code means appending a new version, never overwriting, and the whole history stays under the same identity.",
+    "- Each activation is its own attempt, stringing user approval, the host-side load, the browser-side load, the private channel, and error diagnostics onto one ID.",
+    "On top of that there are exactly two pointers: one at the last version that fully succeeded, one at the target currently being attempted — or the one that just failed. When something fails, only the second one gets dirty. The first doesn't move.",
+    "Put another way: the update blows up, the pointer to the old version is still there, the source is still there. The model can read the diagnostics, write a revision, and retry — or roll back with a single command.",
+    "There's another split that's just as clean: defining a plugin only records it; anything with side effects hangs off a run. Submit some code and the system validates the metadata, pre-compiles it to check syntax, mints an ID, stores it in memory, and stops there — no approval request, no execution, no pointer moved. The response text says outright that it isn't running yet.",
+    "Stopping and unregistering are separate too. Stopping tears down the running copy but keeps the definition, the grant, and the pointers; unregistering is the permanent delete.",
+    "All four actions check ownership, and the wording when a check fails is deliberate: a plugin defined by another session reads as \"doesn't exist,\" not \"not permitted.\"",
+    "**Hot-update reliability comes from immutable versions, not from making the update itself sturdier.** The first is structure. The second is luck."
+   ]
+  },
+  {
+   "heading": "The model doesn't learn the runtime from documentation",
+   "body": [
+    "When you have a model write plugins into a runtime, the first question isn't whether it can write them — it's how it's supposed to know what's in that runtime at all.",
+    "The usual approach is to hand it documentation. The problem with documentation is concrete: it describes what the repository is supposed to look like, not what this process actually looks like right now. Which plugins are loaded, which services are alive, which ones have already been torn down — documentation knows none of it.",
+    "What it does instead is fetch two kinds of fact separately, then cross them.",
+    "\"What's running right now\" comes from the runtime's own registry — walking the symbol keys on its reflection store to get each service's name, the lifecycle unit providing it, and that unit's current state. This is live; it can't go stale.",
+    "\"What each service can do\" comes from a generated catalog. A script walks the syntax tree of the repository source to produce it — four thousand seven hundred–odd lines covering public method signatures and their comments, event dispatch modes and listener contracts, and the type declarations those signatures reference. It comes out of the same walk that renders the doc site, so the data and the docs can't drift apart, and there's a dedicated gate checking that it's fresh.",
+    "One judgment call in the crossing is worth noting: a live service the catalog doesn't cover still gets listed, marked \"reachable, but no signatures,\" rather than treated as nonexistent.",
+    "In other words, the registry is the authority on what exists; the catalog is only an annotation on how to use it. Get that backwards and the model will decide a live capability doesn't exist just because it couldn't look it up.",
+    "Inspection itself comes in two levels. Ask with no arguments and you get a compact list of services and signatures; ask again with an exact service name and you get the full description, the closure of referenced types, and a snippet you can copy straight out — how to reach an optional dependency, how to null-check it afterward, and that a hard dependency has to be declared before you reach for it. It's positioned explicitly as \"confirm names and signatures before writing code,\" not as a source of business data.",
+    "**What you show the model shouldn't be a description of how the system is supposed to be — it should be how the system is right now, plus how to use it.** Those two come from different places and go stale at different rates; blend them into one document and half of it is guaranteed to be wrong."
+   ]
+  },
+  {
+   "heading": "When you refuse, don't just say no",
+   "body": [
+    "Code in a sandbox always reaches for things it can't reach. The model is used to writing server-side code, so its first instinct is to load a module, make a request, set a timer.",
+    "The usual approach is to delete those globals. The code runs, you get \"undefined,\" and then what? A model that sees a missing variable takes the cheapest guess available: try a different name. That's one tool call burned for nothing.",
+    "Here the banned things aren't absent — they're replaced with traps that throw, and the error message spells out which capability to use instead and how to write it.",
+    "- Try to load a module and what comes back is: modules aren't available; read files with the file capability, make requests with the web capability, start processes with the command-line capability — and here's which inspection tool to call first to get the exact names.",
+    "- Try to set a timer and what comes back is: declare a dependency on the timer capability first, then use the two methods it hangs on you — plus a note that those calls are lifecycle side effects and get cleaned up automatically when you stop.",
+    "Honestly, one detail says a lot about whether they actually watched how the model behaves: the global that carries process information is deliberately left undefined rather than turned into a trap.",
+    "The comment gives the reason — probing whether a global exists with a type operator is an extremely common way to degrade gracefully; if that name is backed by an accessor that throws, the probe itself blows up while it's being evaluated, and the code that wrote the probe only wanted to step back cleanly. So only globals holding functions become traps; globals holding data stay absent.",
+    "What gets added into the sandbox is equally restrained: one logging outlet tagged with the plugin ID, a pair of Base64 encode/decode functions (the closure captures the host's buffer implementation, but the buffer itself never gets exposed), a pair of text encoders and decoders, and three registration helpers. That's all.",
+    "**The value of a model-facing error message isn't in explaining why something is disallowed — it's in saying what to write instead.** The first is a rulebook for humans. The second is what actually saves a whole round of trial and error."
+   ]
+  },
+  {
+   "heading": "What it blocks isn't looking. It's calling.",
+   "body": [
+    "For a plugin to do anything, it needs a handle on the runtime — to register services, attach listeners, read other capabilities. But hand over the real handle and the sandbox was pointless: that handle carries the entire runtime tree, and two hops up you're touching the root.",
+    "The usual approach is convention: document what may and may not be touched, then hope the caller behaves. That barely works on people. On a model it does essentially nothing.",
+    "What it hands over is an allowlisted proxy front. The only things that get through are a set of lifecycle-safe verbs — register an effect, attach a listener, attach a one-shot listener, provide a service — plus a few timer helpers, plus one optional lookup function, plus exactly the capabilities this plugin declared it would use. Nothing else.",
+    "Refusals come in two flavors, because the fixes differ. Read a capability that really exists but was never declared, and the message is: declare it, so the framework can legitimately suspend you when the provider goes away. Read an internal framework member and the message is: these are withheld by design — here are the alternatives you can use.",
+    "Writes are refused across the board, on the grounds that the front isn't the real runtime object, and letting a plugin park state on it would create the illusion that the state was stored.",
+    "The injected capabilities get a wrapper of their own that does exactly one thing: if any method returns a runtime context, refuse on the spot. The comment is blunt about it — services should return data; returning a context means handing out a brand-new handle with no front around it, which is precisely the hole the front exists to plug. When the return value is asynchronous, it gets checked again as it settles.",
+    "The layer most worth calling out on its own is the tool registry. A plugin can touch three things: register a tool, list all tools, get one by name. And getting one by name returns a read-only view, not the real tool definition.",
+    "The comment lays out the full reason: the real definition carries an executable function, and with it in hand you can call another tool directly, skipping identity protection, the pre-policy, the monotonicity guard, the around-dispatch, the post-policy, the final observation, and result normalization — the entire chain. So get-by-name and list-all return the same kind of thing, with no callable member anywhere inside.",
+    "**What this front actually blocks isn't looking. It's calling.** Names and parameters being seen costs nothing; an executable function getting into someone's hands opens a shortcut around the whole policy chain."
+   ]
+  },
+  {
+   "heading": "Between the two worlds, only plain objects get through",
+   "body": [
+    "The sandbox is a separate realm — its own globals, its own built-in constructors. That creates two kinds of trouble, pointing in opposite directions.",
+    "One is on the way in. The host passes in an array, code inside the sandbox does the most ordinary type check imaginable, and the answer comes back \"not an array.\" Because the array constructor on each side is simply not the same thing.",
+    "The usual options are to tell plugin authors not to type-check (not realistic) or to swap out the host's built-ins wholesale (unpredictable fallout). What it does is inject a prelude the moment the sandbox is built, rewriting the recognition hook only on the sandbox side's constructors so they accept instances from both sides. Not one host built-in is touched.",
+    "The other is on the way out, and it's the more serious one. Every value coming back from the sandbox to the host — what a tool execution returns, the content blocks it renders, what a handler returns — goes through a clone.",
+    "The clone refuses by default: class instances, functions, collection types, dates, undefined, non-finite numbers, negative zero, cycles, non-plain prototypes, symbol keys, non-enumerable keys, sparse arrays — none of it gets through.",
+    "Two implementation details exist to serve it: properties are written back by defining them rather than assigning, to sidestep the assignment semantics of that one special key on the prototype chain; and the walk uses an explicit work stack rather than recursion, so deep nesting is bounded by memory instead of by the call stack.",
+    "The refusal text stays instructional: it doesn't name a rule, it says build a plain object out of the values you need and return that, and if the caller doesn't need a return value, return nothing. The comment explains why — the most common cause is a handler casually passing back the result of the previous call as-is, and the fix is a single keyword.",
+    "There's a quieter checkpoint too. The object a tool definition comes out of carries a non-enumerable symbol mark, and registration verifies it. Hand-roll a tool definition that looks identical and it won't register — because argument normalization, structural validation, and the return-value clone all happen inside the function that produces it, so no mark means none of that ran.",
+    "**As long as the two sides don't share constructors, there is no such thing as passing something across as-is.** Once you admit that, the rest of the work turns concrete: define the smallest set of values both sides agree on, then hold that line at the boundary."
+   ]
+  },
+  {
+   "heading": "How bad news gets back to the model",
+   "body": [
+    "Asynchronous bad news is the hardest kind. Once a plugin is mounted, a listener it registered might not fire for the first time until minutes later — and then it throws. By then that tool call returned long ago, and the model's attention is somewhere else entirely.",
+    "There are two usual approaches and both are bad. Either the tool blocks waiting for a result, turning one registration into a long poll; or you just drop it and let the error go to the log — and going to the log means the model never sees it, and not seeing it means it never happened.",
+    "What it does is inject the outcome backwards: drop a message into the model's next step, attributed to that plugin. A render that crashed, a host-side handler that threw, a refusal from the front — all of it travels this same path.",
+    "A plugin with a browser half can't start itself; a person has to click once in the interface. So the two run paths are fully separate: a host-only plugin is evaluated and committed directly; a plugin with client code mints an approval request, broadcasts an event carrying metadata and no code, and returns \"awaiting approval\" immediately — the tool doesn't block and doesn't poll.",
+    "Source code reaches the browser by exactly one route: after the page has approval, the host half runs first, and only on success does the page go fetch the client code separately — a fetch that checks plugin ownership and the exact run ID. Code never rides along on a broadcast. Grants come in two grades: one checkbox authorizes only the version in front of you, two authorizes this plugin's later versions along with it.",
+    "The injected text comes in three shapes, by outcome. One for success. The user-declined one states outright: don't ask again unless the user brings it up. The technical-failure one carries the cause, the error message, the stack, and both version pointers, current and target — and ends with an explicit instruction: read the diagnostics, write a revision under the same identity, retry on your own.",
+    "There's also deduplication. Each run keeps a set of what it has already reported, keyed by platform plus category plus message joined into one string, and duplicates are dropped. Without it, a listener firing once a second can flood the context with thirty identical messages in half a minute.",
+    "One more piece of restraint: mentioning a plugin in the session injects its identity, its version pointers, and its run state — not its source. To read the source you have to call the inspection tool explicitly, and supply both the identity and the version ID.",
+    "Or push it one step further: whether an agent can correct itself depends on whether its failures get written into something it can read on the next turn.",
+    "**The real feedback channel in an agent system isn't the log — it's whatever can be written back into the next turn's input.** Logs are for humans debugging; only what makes it into the next turn's input gets a say in what the agent does next."
+   ]
+  },
+  {
+   "heading": "It admits, itself, that this isn't a security boundary",
+   "body": [
+    "To be blunt, people who build sandboxes have a very common failing: once it's done, the claim quietly slides from \"some capabilities are restricted\" to \"it's secure.\"",
+    "The usual approach is to blur it — the docs say \"isolated execution,\" \"restricted environment,\" and never say what is stopped or what isn't. Readers fill in the gap themselves, and what they fill in usually skews optimistic.",
+    "Here it goes the other way. The header of the sandbox module says, in its own words: this keeps cooperative plugins inspectable and disposable, but it is not containment — helper functions from the host realm are still an escape route.",
+    "The browser half is even more direct: this is API discipline, not a security boundary; the code of a dynamic plugin is exactly as trustworthy as the host process that accepted its definition.",
+    "Two readme documents turn that into one actionable line: treat loading this toolset as granting command-line access. The reasoning is concrete — the sandbox isolates globals, but the capabilities a plugin declares are wired to the real runtime, and reading and writing real files and starting real processes are all still on the table.",
+    "Even one deliberate piece of duplicated code has its reason written down. The front code on the two halves overlaps, and the overlap is marked to be ignored by clone detection: the halves live in different compiled programs, the keys merged onto the context differ, and they don't unify. More importantly, \"a service must never hand a context to sandboxed code\" is a security invariant, and it belongs in whichever half enforces it rather than being hoisted into a shared package. This is a stated trade-off, not a refactor nobody got around to.",
+    "I've come to think that the most valuable part of any such write-up is usually not what it claims to stop — it's what it's willing to admit it doesn't.",
+    "**A vague security claim is more dangerous than a clear statement of insecurity.** The first gets deployed as if it were containment. The second at least puts the deployment decision on real premises."
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Compile it once first, but don't run it",
+   "how": "The usual approach is to skim the syntax with a lightweight parser at submit time and hand it to the engine when it actually runs. Two parsing paths drift apart sooner or later: the pre-check passes and the run blows up, or the line number from the pre-check is several lines off from the real position and the model is left guessing. What it does is compile once at submit time in a compile-but-don't-execute mode, then run through the same engine with the exact same one-line wrapper. Same compiler, same wrapper, so the line-number offset is identical on both sides. And what comes back isn't a bare message — it's the whole slice of the stack up to the syntax-error line, handing the model the source line and the caret together.",
+   "why": "Code that can't run is stopped before an ID is minted or any side effect happens, and it closes off the old \"pre-check waved it through, runtime blew up\" problem that two parsers always produce."
+  },
+  {
+   "name": "Guess what the model got wrong from the line that failed",
+   "how": "The engine's default syntax hint is close to useless for a model; all it says is \"unexpected identifier.\" The usual approach is to forward it as-is. This does one more step of classification: check whether the failing line contains a type-assertion keyword. If it does, call it type annotations that leaked into a plain script and hand back a side-by-side of the wrong way and the right way. If it doesn't, give a bracket-balancing hint, note explicitly that the code runs as an async function body and that line numbers carry a one-line offset, and name the most common mistake — closing with a right paren and a semicolon, which closes a call that was never opened.",
+   "why": "Why look only at the failing line instead of scanning the whole block? The comment says why: that keyword happening to appear inside some ordinary description string would misdirect a plain bracket error into \"delete your type annotations.\""
+  },
+  {
+   "name": "Some globals should be intercepted; some can only be made to vanish",
+   "how": "The usual approach is to delete every global that shouldn't be there, or replace all of them with accessors that throw. Delete them and the caller sees only \"undefined\" with no idea what to use instead; make them all throw and feature detection stops working. This splits by the type of the value: globals holding functions become traps that throw, with the error carrying the replacement capability, how to declare it, and which inspection tool to check first; globals holding data stay absent. The dividing line is drawn at how that name normally gets probed — probing whether a global exists with a type operator is an extremely common way to degrade gracefully, and if an accessor that throws is sitting behind it, the probe itself blows up.",
+   "why": "Before you ban a global, work out how it normally gets detected — otherwise the interception kills the ordinary graceful-degradation path along with it."
+  },
+  {
+   "name": "What a plugin gets is a list of what it can reach",
+   "how": "The usual approach is to hand the context object straight to the plugin and let documentation say what's touchable. But the context carries the whole runtime tree, two hops up is the root, and a convention stops nobody. What it hands over is a proxy front: reads are decided in order — the tool registry gets a read-only front, the optional lookup gets a lookup function, a hit on the verb allowlist forwards lazily (timer verbs additionally require the timer capability to have been declared), anything else is matched against the capabilities this plugin declared, and the remainder is refused. Writes are refused, all of them. Existence checks only reflect reachability; they neither resolve nor throw.",
+   "why": "A plugin can only touch things that come down when it does; and using something you never declared is closed off — only a declared dependency lets the framework legitimately suspend the plugin and wait when the provider goes away."
+  },
+  {
+   "name": "You can see the name, but you can't get the function",
+   "how": "The usual approach is to let a plugin fetch a tool definition by name — it already has permission to register tools, so peeking at someone else's definition seems harmless. But the real definition carries an executable function, and with it you can call another tool directly, skipping identity protection, the pre-policy, the monotonicity guard, the around-dispatch, the post-policy, the final observation, and result normalization — the whole chain. So get-by-name and list-all return the same read-only view: name, description, parameters, and no callable member anywhere. The reverse direction is closed too — a tool definition carries a non-enumerable symbol mark that registration verifies, and a hand-rolled object that looks the same doesn't get in.",
+   "why": "Argument normalization, structural validation, and the cross-realm clone of return values all happen inside that producing function. A shortcut around the policy chain will get taken if it exists at all."
+  },
+  {
+   "name": "The same error interrupts the model only once",
+   "how": "The usual approach is to report every occurrence. Inside a model's context that's a disaster: a listener a plugin registered might fire once a second, one error can flood the context in half a minute, and thirty identical messages make it harder, not easier, for the model to work out what actually went wrong. Each run keeps a set of what it has already reported, keyed by platform plus category plus message joined into one string, and duplicates are dropped. The one that survives carries the error message, the stack, and both version pointers, current and target, and ends the same way every time: define a corrected version under the same identity and retry on your own.",
+   "why": "Context is a finite resource, and repeated bad news crowds out useful evidence; writing the fix directly into the message saves the model a tool call spent asking what to do next."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Make validation time and execution time share one compiler and one piece of wrapper code.",
+   "why": "Two parsing paths drift apart sooner or later, the reported position stops matching the hint, and the caller is left guessing. Here the pre-check compiles without executing, execution goes through the same engine, and the wrapper string is identical character for character — so the position reported by the pre-check and the position reported at run time line up by construction, and even the error text comes out of the same function."
+  },
+  {
+   "lesson": "When you refuse, hand back a snippet the caller can copy, not the name of a rule.",
+   "why": "The caller is a model, and what it needs isn't \"this isn't allowed\" — it's \"write this instead.\" Every error for a banned capability here carries the alternative, how to declare it, and which inspection tool to check first; the error for an undeclared capability also explains what declaring it buys you. What that saves is a whole round of trial and error."
+  },
+  {
+   "lesson": "When you open something to untrusted code, filter on what can be called, not on what can be seen.",
+   "why": "Seeing names and parameters is harmless; getting hold of the executable function opens a shortcut around the whole policy chain. Drawing the line at whether a value contains a callable member is easier to hold than drawing it at whether a field is sensitive — the first is a structural judgment, the second is a subjective one."
+  },
+  {
+   "lesson": "Change code by appending an immutable version, and express current state with pointers.",
+   "why": "Immutable versions plus a current pointer and a target pointer turn \"the update failed\" into a benign state: the old pointer is still there, the source is still there, you can read the diagnostics and retry with a revision, or roll back with a single command. Under overwrite-in-place, one failed update destroys the live copy and the way back at the same time."
+  },
+  {
+   "lesson": "When a sandbox isn't containment, write that down instead of blurring it.",
+   "why": "The header of the sandbox module here states outright that host helper functions are still an escape route, and the readme lands the conclusion on: treat it as granting command-line access. A vague security claim is more dangerous than a clear statement of insecurity — the first gets deployed as if it were containment, the second at least puts the decision on real premises."
+  }
+ ],
+ "tradeoffs": [
+  "The sandbox is not a security boundary, and the module docs say so themselves: helper functions from the host realm are still an escape route. Even without escaping, the file and command-line capabilities a plugin declares are wired to the real runtime. And the five-second default evaluation timeout only constrains the synchronous part — the asynchronous tail escapes it entirely. This guards against misuse, not malice.",
+  "With no page connected, a plugin with a browser half hangs waiting for approval indefinitely, with no timeout. Unattended automation therefore can't use this kind of plugin — the only way it ends is the turn that started it being cancelled.",
+  "A host-only plugin goes through no user approval at all: the model calls once and it is evaluated and mounted. Human approval covers only the kind with a browser half. The real gate is whether this toolset was loaded, not any individual run — a trade-off worth thinking through before you deploy.",
+  "Everything lives only in process memory. After a restart the identities, versions, and grants are all gone, and there's no automatic path from a successful experiment to a real plugin file. Keeping something means rewriting it through the normal development process — this is a proving ground, not a delivery path.",
+  "Logs from inside the sandbox go straight to the host's standard output, tagged with the plugin ID, and never into the tool result, because listeners usually fire long after the call returned. The cost is that the model can't read back its own logging and has to work backwards from the injected diagnostics, leaving it with far fewer debugging moves than a person has.",
+  "This package's readme and the header comment on the inspection module still describe an earlier shape: a single inspection tool with a category argument, shorter two-part IDs, and a claim that the front doesn't expose the register-an-effect verb. What actually exists is seven tools, three levels of identity, and that verb sitting in the allowlist. Trust the code."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/extensions/cordis-host-runner/src/sandbox.ts",
+   "note": "node:vm sandbox construction, callable-trap redirection for banned APIs, Script syntax pre-check and instructional error text; the module header states \"is not containment\""
+  },
+  {
+   "path": "packages/extensions/cordis-host-runner/src/guard.ts",
+   "note": "allowlisted ctx Proxy front, read-only ToolRegistry view, cross-realm explicit-stack JSON clone, sandboxDefineTool's symbol mark"
+  },
+  {
+   "path": "packages/extensions/cordis-host-runner/src/index.ts",
+   "note": "the define/run/stop/undefine main flow, the approval round trip, failure steering injection and the dedupe set; vmTimeoutMs defaults to 5000"
+  },
+  {
+   "path": "packages/extensions/cordis-host-runner/src/registry.ts",
+   "note": "three-level Plugin/Package/Run records, the currentPackageId and nextPackageId pointers, ID minting of every kind and ownership checks"
+  },
+  {
+   "path": "packages/extensions/cordis-host-runner/src/lifecycle.ts",
+   "note": "the host half mounts as a child fiber; on failure it unloads without leaving wreckage"
+  },
+  {
+   "path": "packages/extensions/tool-cordis/src/index.ts",
+   "note": "registration of the seven model tools (cordis_inspect_list/query/self plus define/run/stop/undefine) and @pluginId context injection"
+  },
+  {
+   "path": "packages/extensions/tool-cordis/src/providers.ts",
+   "note": "the four Service/Event/Builtin/Tool inspection providers; api-catalog.ts in the same directory is the 4751-line generated catalog"
+  },
+  {
+   "path": "packages/extensions/cordis-client-runner/src/client/evaluator.ts",
+   "note": "browser-half closure evaluation, redirecting by shadowing globals with parameters; guard.ts in the same directory states \"API discipline, not a security boundary\""
+  }
+ ],
+ "related": [
+  "cordis-core",
+  "tools",
+  "agent",
+  "web-client"
+ ]
+}

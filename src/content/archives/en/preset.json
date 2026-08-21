@@ -1,0 +1,222 @@
+{
+ "id": "preset",
+ "lede": "Two sessions in one process. The first one holds two tools, the second twenty; the two call themselves by different names in the system prompt, and they differ on whether a full context gets compacted. That's the effect the product wants.\n\nThe trouble is all in the implementation. The intuitive move is to install the whole config once per session — one set of instances per session. But these plugins predate the mechanism. They were written for a single shared world and slot themselves by session internally — install two copies and you have two things that each believe they're the only one, alive at the same time.\n\nSo this takes a less intuitive road: a config is installed exactly once per process, and a session doesn't install it — it joins it.\n\n**The hard part was never installing a config. It's letting many sessions share one installation while each of them believes it has the thing to itself.**",
+ "packages": [
+  "packages/preset/agent-presets",
+  "packages/preset/persona",
+  "apps/cli/config/agent-presets"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "A composition shouldn't be a row of flags",
+   "body": [
+    "The layer of a session that faces the model is, in fact, entirely replaceable. Which tools it holds, who it says it is in the system prompt, whether a full context gets compacted, whether it can dispatch subagents — in this repo all of that comes from plugin lines, one per line.",
+    "The question isn't whether you can swap it. It's how those lines get organized.",
+    "The usual answer is startup flags: add a batch of switches and assemble a combination each time. Once there are enough flags, nobody can say which one a given run actually used — let alone hand it to a colleague to reproduce as-is.",
+    "The choice here is to make the composition itself a thing: one directory is one config, the directory name is its identifier, and inside sits a list of plugin lines plus a manifest that carries nothing but display text.",
+    "Four ship with the app, and they span a wide range. The smallest is 62 lines and gives you one persistent shell and one string-replace editor; the two largest are 262 lines each, and one of them replaces how tools are presented altogether — the model no longer calls one tool at a time but writes a TypeScript program, collapsing what used to be five round trips into one.",
+    "**All four can run in the same process at the same time, invisible to each other.**",
+    "The other half of the work is more tedious than that, and more important: drawing the line.",
+    "The registry itself, the sandbox and approval stack, persistence, model routing — those stay on the host layer; a config takes only the lines that face the model. The four bundled files spell out, section by section, why a given service has to stay on the host side — not out of good commenting habits, but because getting this line wrong blows up on the spot.",
+    "Whether a composition can be copied, deleted, and handed to someone else unchanged is really what decides whether it belongs to the product or to ops. This repo puts it on the product side."
+   ]
+  },
+  {
+   "heading": "Install once; everything else is just joining",
+   "body": [
+    "Start with why you can't install it once per session.",
+    "The plugins inside a config predate this mechanism. They were written for a single shared world and slot themselves by session internally. Give each session its own copy and you have several things that each believe they're the only one alive at once; the second session collides with the first one's instances.",
+    "So this goes the other way: a config is installed exactly once for the whole process, hung at a long-lived spot. Its plugin instances, tool registrations, prompt sections — there is exactly one of each in the world.",
+    "So how does a session get to use it?",
+    "Through an opaque scope key — compared by object identity, with parent-child links between keys. A session's key is bound to the long-lived installation's key, and two things hold at once: registration views inherit down the chain, so the session can see the ancestor layer and the nearer layer wins; and event delivery passes up the chain, so listeners hung at the long-lived spot receive the events this session dispatches.",
+    "In other words, joining is one pointer binding. No disk reads, no waiting on anything async, no way to fail.",
+    "That buys an unglamorous but decisive benefit: the window in which a subagent gets created is synchronous and not allowed to fail, and a single pointer binding fits right into it.",
+    "And the binding handle is private, locked in a weak-reference table under the session's scope key. It's the only capability in this set of primitives that can change a parent link — no other code in the process can move an already-composed session under a different config, and even this package's own switch-config entry point has to rebind through that handle.",
+    "Next: files get edited. A config is files, files can be edited at any moment, so what happens to the sessions already running.",
+    "Neither common answer is good. Ignore it entirely, and an edit means restarting the whole process. Hot-reload, and a session mid-conversation has the tools swapped out from under it, while its earlier turns were produced under the old ones.",
+    "This takes a third road: generations. Every installation records the file's modification time and byte count; when the next session comes for it, the stamps get compared first, and a mismatch opens the next generation for that session. Sessions already joined to the old generation stay exactly as they are, unaware, and with no need to be aware. The stamp is taken before the file is read, so that an edit racing the installation looks stale rather than current — better one generation too many than one too few.",
+    "Subagents come through a different door: instead of re-resolving the parent's config by name, they bind straight to the parent's generation. The comment says why, bluntly — re-resolving by name would read a file edited after the parent started, so the child would run on a different generation than its parent; and if that config had since been deleted, the child would fail outright while the parent kept running. **A child should inherit its parent's instance, not its parent's name.**"
+   ]
+  },
+  {
+   "heading": "Once it's installed, something has to sign off",
+   "body": [
+    "A subtree spliced directly into a context never shows up in the loader's entry list. Which means the whole-system audit at startup doesn't cover it at all.",
+    "The usual answer is convention: whoever writes the config should be careful. That barely holds in a repo with four configs, and stops holding the moment users can copy and rewrite them.",
+    "So instead, the installation checks two things about itself when it finishes. Either one failing tears the whole subtree down and rolls back session creation with it — no half-installed session is left behind.",
+    "First: no line may be stuck on a missing service. Import failures and plugins that throw are rejected by the loader itself; what's left to observe is a quieter kind of failure — the line is alive, but it waits forever on a service this composition never provides. The check walks every non-disabled entry in the subtree, takes the injection names it declares, and asks the current context one by one whether each resolves. The loader folds several failed lines into a single aggregate error that names nobody, so this flattens it back out into one cause per line.",
+    "Second: no service may leak into the global.",
+    "I think this is the design worth looking at most in the whole package, because it's a structural decision, not a heuristic guess.",
+    "The runtime keeps service implementations in a symbol table: a provider with a private namespace hangs its implementation under a symbol private to that domain, and one without hangs it under the symbol for that name on the root context. The audit walks every symbol, first deciding by object identity whether a given implementation was published by this installation's subtree, then checking whether the symbol that same name points to in the root domain is that same object. Same object means a leak.",
+    "The answer is yes or no. There's no middle.",
+    "Object identity rather than the numeric id, and the comment says why: the id comes from a counter kept per registry, so objects in two different roots collide on it, and a subtree in one runtime gets blamed for a service published by another.",
+    "**The moment an audit starts matching on names or ids, it degrades from a decision into a guess — and an audit that false-alarms stops being read very quickly.**",
+    "One hole still needs plugging. The self-check at install time runs once, at the instant the subtree is stable, so a plugin that publishes a service after its own function body returns — from a timer, from an async continuation — slips right past that window. So there's also a long-lived probe that listens for changes to service registrations and re-runs the same detection over every live composition on each change. The cost: it belongs to the development composition, and the shipped host doesn't load it."
+   ]
+  },
+  {
+   "heading": "\"Make it private when you can\" is a trap",
+   "body": [
+    "Once you have private namespaces as a tool, it's easy to reach the lazy conclusion: make it private whenever you can.",
+    "The line drawn in this repo is much finer than that, and it comes with a test you can actually apply.",
+    "What should be private: the terminal registry, plan-mode state, the context compactor, the tool-result trimmer, the workflow engine — these are one-per-session by nature, and a private namespace is the correct lifetime for them.",
+    "What shouldn't: the background-task registry, the subagent registry, the goal service, the usage meter — those stay on the host side. Not because they're \"more important,\" but because their consumers live outside the config — a host line has to resolve one, or a remote call from the browser side has to query it across sessions, and an entry-local private domain is invisible to everything outside the group, the host included.",
+    "So the test is one sentence: **if a host line injects the service, the service has to stay on the host side.** Injection resolves before any session exists, and at that point there's no session to serve as a key.",
+    "That same invisibility leaves one case that needs a door cut for it: the request comes from outside any session but asks about something inside one. Every remote call from the browser side looks like this.",
+    "The door cut here is a read-only channel: take the session, find the installation it joined, then look in the service table for the implementation belonging to that subtree. It reads the same ownership relation the leak audit reads, only in the opposite direction.",
+    "There's another category: things a config wants to change and can't. The system-prompt registry stays on the host side, and it unconditionally registers a deployment-level persona section. So a persona plugin exists that can only be mounted inside a scope — inside a config, it shadows the deployment persona for that one session; mounted globally, it collides by name with the registry's own registration and fails.",
+    "That \"only mountable inside\" constraint is exactly the reason it exists. **Without it, a config could swap out a session's tools but not who the session is.**"
+   ]
+  },
+  {
+   "heading": "Which one you're running under is the log's call",
+   "body": [
+    "Session creation records a header: which config it started under. That's a deep-frozen fact about creation, and it never changes again.",
+    "But a blank session — one that hasn't produced anything yet — can switch configs, and the switch outlives that blank window: the first turn and every turn after it run under the new composition.",
+    "Which means the creation header is no longer the answer.",
+    "The usual approach trips right here: restore from the header after a restart and the switch is silently undone — the session quietly reverts to host tools and the deployment persona, and nothing anywhere reports an error.",
+    "So switching configs has to land as a log event, and resolution scans backward from the end of the log for the last selection, falling back to the header only when it finds none.",
+    "The repo's own rule requires this: anything that enters a model request must be reconstructable from the session log. A config decides which tools the model sees and which prompt sections it reads, so of course it counts.",
+    "Several entry points honor the rule explicitly: cold-restoring a session resolves from the log; forking a branch resolves the source session's from the log; even a cold read that starts no session at all — one that only needs the renderers in order to display historical tool calls — resolves from the log, then asks for a long-lived scope key to use as its view scope, and that long-lived spot composes plugins only: no session, no turns.",
+    "Switching itself carries two constraints. The session must still be blank, because a conversation already underway has a history produced under the old tools; that judgment belongs to the caller, and this package doesn't read session history. And the switch is a rebinding of the parent link rather than a teardown-and-reinstall — the new composition is secured before the link moves, so a failure leaves the session untouched, with no half-dismantled state to recover from.",
+    "There's also a check against crossed wires: take over an existing session while naming a config, and if what it actually runs differs from what was asked for, it's rejected as a conflict; take it over without naming one and it's always adopted as-is, so reconnects, restores, and create-retries — the common paths — are unaffected.",
+    "**If a decision affects what the model sees as input, it has to land in the log as an event.** Otherwise restart, restore, and fork each rebuild the same session into a different shape — three of them — and quietly."
+   ]
+  },
+  {
+   "heading": "The broken one stays on the list too",
+   "body": [
+    "Start with a question that looks unimportant: a config's composition file is malformed — what should the list do with it?",
+    "The usual answer is to skip it — if it won't read, treat it as absent.",
+    "But that directory still holds the name. Skip it and a user who tries to copy something under the same name gets rejected for a duplicate, while the interface shows nothing they could delete.",
+    "So it stays on the list, marked broken, with a reason a person can read: the composition file is missing or unreadable, it won't parse, the top level isn't a list of plugin lines, a line has no plugin name — all of these count.",
+    "These checks belong to discovery, not to installation. The list itself is rescanned every time, never memoized — a config written while the process runs is visible immediately, and a deleted one drops off the list at the next read.",
+    "The roots to scan are \"the ordered list from settings, plus the one fixed writable root under the home directory,\" and that derivation happens exactly once. Otherwise \"list them\" and \"copy based on that list\" could see different sets of directories, and a copy would land somewhere the caller never saw. Appending rather than prepending is what lets the earlier-declared root win a name collision — the one shipped with the app still shadows a local directory of the same name.",
+    "Parsing uses the loader's own dialect, embedded expressions and all. A health check that runs ahead of something has to use that something's own parser, or sooner or later you get \"the check says broken but it runs fine,\" or the reverse — and either mismatch teaches people to stop trusting the marker.",
+    "The flip side is that it's shallow: it doesn't resolve plugin names and doesn't apply config. \"Discovery says it's fine\" is not \"it will install\" — the real verdict comes from the two self-checks after installation.",
+    "Identity is settled at this layer too: the root shipped with the app is marked system, the local root is marked user. The artifact itself can only write display text — a display name, one line of description, a sort position. The identifier is the directory name and the trust comes from the root; neither is writable.",
+    "**Identity comes from where a thing was found, not from what it says about itself.** The localized copy in the interface goes only to rows that are trusted as system and whose identifier is on a known list; a name a user wrote shows up exactly as written."
+   ]
+  },
+  {
+   "heading": "The only write action is a copy",
+   "body": [
+    "Letting users edit configs sounds like a UX question.",
+    "It's a privilege question.",
+    "Every line in a config is an executable plugin. If the product has any path at all that lets a user write into the composition text, that path is a privilege-escalation entry point.",
+    "The usual approach is to build an editor and then pile review, allowlists, and confirmation dialogs on top of it.",
+    "What's done here is both less work and more complete: writing consists of three actions — copy a whole directory, delete, and open that directory in the file manager. **Composition text never crosses this boundary.**",
+    "Copy takes only the source's identifier and an optional display name; the host resolves the source directory using its own roots and copies it verbatim. The result is that a copy grants no capability the source didn't already have — the copy installs exactly as the source does, so there's no need to actually install one to check.",
+    "It copies the whole directory rather than one file, because one of the bundled configs carries a skills directory of its own. Symlinks are dereferenced, so a copy is self-contained instead of a pile of links pointing back into the install directory. Afterward the permissions are tightened to owner-only read/write, because a shipped install is usually world-readable and a copy would inherit that bit; the executable bit is kept, because a config can carry helper scripts meant to run.",
+    "A copy that fails partway deletes the whole directory. Better to leave nothing behind than to leave something discovery can't see, or something that installs but is incomplete.",
+    "The copy's display info is rewritten: the description is kept, the name and sort position are not. A copy that looks identical to its source, or that sorts itself into the declared order of the bundled set, would make the list stop distinguishing them; if nothing is left to write, the file is deleted rather than left there empty.",
+    "Writes are only allowed to land on the local root. Delete refuses configs shipped with the app, and additionally verifies that the resolved directory really sits under the writable root. Pointing the editor at a shipped install is refused too, because those edits would be silently overwritten by the next upgrade.",
+    "Deleting a config a session is currently using is allowed: the composition was read once at creation and never re-read, so that session keeps running unchanged. If the deleted one happens to be the user's default, the default gets cleared — leaving it would make every later session that doesn't name a config fail to start, while clearing it exposes the deployment's own default underneath.",
+    "This section reads like a pile of fussy filesystem details, but they all point at the same thing: compress authoring down to an action that creates no new capability, and the rest of the security no longer has to be guaranteed by review."
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Install once; joining is just binding a pointer",
+   "how": "The usual approach mounts the config once per session, one set of instances per session. This goes the other way: a config is composed exactly once per process and hung at a long-lived spot; concurrent first uses collapse into the same composition, and a failed one is dropped from the table so it can be retried. A session doesn't install it — it binds its own scope key to the long-lived spot's key. Registration views inherit down the chain, with the nearer layer winning; event delivery passes up the chain, so listeners hung at the long-lived spot receive this session's events. The difference is that joining is no longer an async composition that might fail, but a synchronous pointer binding.",
+   "why": "The reused plugins were written for a shared world and slot themselves by session internally, so one copy per session is bound to collide; and only a synchronous join that cannot fail fits into the subagent creation window, which is not allowed to fail."
+  },
+  {
+   "name": "An edited file opens a new generation; the old one doesn't move",
+   "how": "The usual approaches are either to ignore edits — which means restarting the whole process — or to hot-reload, which swaps the tools out from under a session mid-conversation while its earlier turns were produced under the old ones. Here every composition records the file's modification time and byte count; when the next session comes for it the stamps are compared first, and a mismatch opens the next generation for that session while sessions already joined to the old one stay exactly as they are. The stamp is taken before the file is read, so a concurrent edit looks stale rather than current — better one generation too many than one too few. If the file attributes can't be read, it keeps using the current generation.",
+   "why": "A composition has to outlive the file's disappearance, while an edit still takes effect immediately for new sessions and disturbs no session already running."
+  },
+  {
+   "name": "Two self-checks after installation",
+   "how": "A subtree spliced directly into a context never appears in the loader's entry list, so the whole-system audit at startup can't cover it, and the usual approach can only rely on whoever writes the config being careful. Instead, the installation checks two things about itself when it finishes. One: no line may be stuck on a missing service — walk every non-disabled entry in the subtree, take the injection names it declares, and ask the current context one by one whether each resolves. Two: no service may leak into the global — walk the runtime's service symbol table, decide by object identity whether an implementation was published by this subtree, then check whether the symbol that name points to in the root domain is the same object. Either check failing tears the whole subtree down and rolls back session creation with it.",
+   "why": "The second is a structural decision, not a heuristic: the answer is yes or no. Object identity rather than the numeric id, because the id comes from a counter kept per registry, so ids collide across runtimes and someone else's problem gets charged to this subtree."
+  },
+  {
+   "name": "A long-lived probe covers what the one-shot audit misses",
+   "how": "The self-check at install time runs once, at the instant the subtree is stable. A plugin that publishes a service after its own function body returns — from a timer, from an async continuation — slips past that window, and the usual approach is to accept the hole. Here a long-lived probe listens for changes to service registrations and re-runs the same leak detection over every live composition on each change. The same probe takes another cut while the system prompt is assembled: if settings name a list of configs, a session really is addressing the model, and that session joined no config at all, it fails outright.",
+   "why": "It moves something that could only warn at publish time to a moment where it can actually fail. The cost is that the probe belongs to the development composition, and the shipped host doesn't load it."
+  },
+  {
+   "name": "A borrowed loader needs two default behaviors plugged",
+   "how": "The subtree is mounted using the loader's include capability, which means inheriting two of its default behaviors — and both have to change. First, the base path: the loader rewrites the base to the config's own directory. That's right for relative paths and wrong for package names — a locally authored config lives under the user's home directory, and walking upward for a dependency directory never reaches the app's own. So the host's base is recorded before mounting, and afterward any specifier that is neither a relative path nor a built-in protocol resolves from there. Second, write-back: the loader writes the entry tree back to the file it read whenever it believes the config changed, and a plugin disposing of itself is enough to trigger that — while tearing down a session disposes of the whole subtree.",
+   "why": "Left unplugged, what write-back actually does is truncate the composition file shipped with the app into an empty list when the first session ends — a config is input, not a persistence target."
+  },
+  {
+   "name": "Which one you're running under is the log's call",
+   "how": "The creation header records the config used at startup, a deep-frozen fact about creation. But a blank session can switch configs, and the switch outlives that blank window. The usual approach reads the header, at the cost that a restart silently undoes the switch with nothing anywhere reporting an error. Here a switch appends a log event, and resolution scans backward from the end of the log for the last selection, falling back to the header only when it finds none. Cold restore, forking a branch, and the cold read that starts no session and only renders historical tool calls all go through that same resolution. The switch itself rebinds successfully first and writes the log after, so a composition that was rejected leaves no record.",
+   "why": "A config decides which tools and which prompt sections the model sees, which puts it squarely under \"model-visible means reconstructable from the log.\""
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Split \"installing\" and \"joining\" into two separate things.",
+   "why": "The reused plugins were written for a shared world and slot themselves by session internally, so one copy per session is bound to collide. Once it installs once and sessions join through a scope parent link, two good things happen at the same time: composition cost decouples from session count, and joining degrades into a synchronous pointer binding that fits inside a creation window not allowed to fail. Those two good things are really two sides of the same one."
+  },
+  {
+   "lesson": "An audit decides on structure, not on names or ids.",
+   "why": "\"Did a service leak into the global\" is answered here by checking the registry's symbol table against object identity, and the answer is yes or no. Match on names or numeric ids instead and two runtimes collide on the same id, someone else's problem gets charged to this subtree, and the audit degrades from a decision into a guess. And an audit that false-alarms stops being read very quickly."
+  },
+  {
+   "lesson": "Identity comes from where a thing was found, not from what it says about itself.",
+   "why": "A config's identifier is its directory name, its trust comes from the root it was scanned under, and the artifact file can only write a display name and a description; the localized copy in the interface goes only to rows trusted as system whose identifier is on a known list. Any design that lets an artifact declare its own identity is a design that lets something locally written impersonate the one shipped with the app."
+  },
+  {
+   "lesson": "Rebuild state from the log, not from the creation header.",
+   "why": "The creation header is a fact about the moment of creation, while a config can change midway and keep effect from there on. If a decision affects what the model sees as input, it has to land in the log as an event — otherwise restart, restore, and fork each rebuild the same session into a different shape, and silently, with nothing anywhere reporting an error."
+  },
+  {
+   "lesson": "A child inherits its parent's instance, not its parent's name.",
+   "why": "If a subagent re-resolves its parent's config by name, it reads a file edited after the parent started, so the two run on different generations; and if that config has been deleted, the child fails outright while the parent keeps running. Put one \"look it up by name again\" in between, and parent and child get a chance to see two different worlds."
+  }
+ ],
+ "tradeoffs": [
+  "Superseded generations are never reclaimed. An edited file opens a new generation, but the old one only disappears when the whole tree is torn down; a TODO in the code states plainly that safe reclamation needs a count of joined sessions first. And an old subtree isn't idle — the skill-discovery plugin is still watching its root directory.",
+  "File stamps are only compared when someone asks for the config again; nothing is actively watching. If the file attributes can't be read, it keeps using the current generation: a composition can't let one failed read stop a session from starting, at the cost that an edit goes unnoticed in that case.",
+  "The two self-checks after installation are one-shot. A plugin that publishes a service after its function body returns is caught only by the long-lived probe in the development composition, and the shipped host doesn't load it — production relies on the weaker guarantee that things were clean at the instant of installation.",
+  "\"This session joined no config\" is a warning at publish time, not a rejection, because a synchronous listener that throws would veto the publish, and creating a bare session is a legitimate path. A comment also records a known false positive: a session created bare and switched to a config afterward gets warned once before its first binding.",
+  "The health check during discovery is a shallow structural check; it doesn't resolve plugin names or apply config. A config the list didn't mark broken can still be rejected at installation — that mismatch is accepted by design.",
+  "Config contents can't be edited from the product: the only write is a whole-directory copy, and actually changing a composition means dropping down to the filesystem or an external editor. Plugging the loader's write-back also gave up its config-update events, so a future \"edit while running\" will need a separate persistence path built for it. Switching configs also requires the session to still be blank, and that judgment belongs to the caller — miss it and the log ends up holding tool calls the new composition could never have produced."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/preset/agent-presets/src/index.ts",
+   "note": "Preset registry: the long-lived mount table, single-flight, generation file stamps, joining and switching"
+  },
+  {
+   "path": "packages/preset/agent-presets/src/mount.ts",
+   "note": "Mounting the subtree, the two audits, bare package name redirection, no write-back, addressing services inside a session"
+  },
+  {
+   "path": "packages/preset/agent-presets/src/discovery.ts",
+   "note": "Scanning roots, deciding a preset is broken, parsing with the loader's own YAML dialect"
+  },
+  {
+   "path": "packages/preset/agent-presets/src/session.ts",
+   "note": "The selection event declaration and the resolver that prefers the log over the creation header"
+  },
+  {
+   "path": "packages/preset/agent-presets/src/authoring.ts",
+   "note": "Whole-directory copy, permission tightening, the writable-root check on delete"
+  },
+  {
+   "path": "packages/preset/agent-presets/src/invariant.ts",
+   "note": "Runtime leak re-check, and failing a session that addresses the model without joining a preset"
+  },
+  {
+   "path": "packages/preset/persona/src/index.ts",
+   "note": "The persona line that can only be mounted in a scope, which lets a preset change a session's identity"
+  },
+  {
+   "path": "apps/cli/config/agent-presets/code/agent.cordis.yml",
+   "note": "A bundled preset instance (262 lines), spelling out section by section what goes into the preset and what stays on the host side"
+  }
+ ],
+ "related": [
+  "cordis-loader",
+  "agent",
+  "session",
+  "subagent"
+ ]
+}

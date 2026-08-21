@@ -1,0 +1,219 @@
+{
+ "id": "subagent",
+ "lede": "You tell an agent to hand off a piece of what it's holding. Who picks it up? Maybe a blank slate just created in the same process. Maybe a copy of the conversation you're in right now. Maybe a command-line program actually launched in a different process. Three very different things — and to the code calling them, they have to look identical. Unifying the interface isn't hard. What's hard is that the interface unifies and the capabilities don't: an in-process child can be forced to emit a structured result, can have its tools trimmed, can be capped on how many more levels it may delegate; a cross-process child can do none of it. So a choice lands in front of you — take the request and quietly degrade, or refuse on the spot. **Almost all of this thing's character is written into its answer to that question.**",
+ "packages": [
+  "packages/subagent/subagent",
+  "packages/subagent/subagent-in-process-driver",
+  "packages/subagent/subagent-spawn-in-process",
+  "packages/subagent/subagent-fork-in-process",
+  "packages/subagent/subagent-claude-code",
+  "packages/subagent/tool-subagent",
+  "packages/subagent/tool-subagent-control",
+  "packages/subagent/tool-subagent-report",
+  "packages/workflow/workflow",
+  "packages/workflow/workflow-worker-thread",
+  "packages/workflow/tool-ralph",
+  "packages/jobs/jobs"
+ ],
+ "confidence": "read",
+ "sections": [
+  {
+   "heading": "Three children, one face",
+   "body": [
+    "The most underestimated part of handing work off isn't how you dispatch it — it's what's on the receiving end. And that question has more than one answer.",
+    "The first kind is a blank slate in the same process: its own session, its own system prompt, not one word of the parent conversation. The second is also in-process, but it's a fork of the current conversation — the parent's log is cut at a point, and that becomes the child's starting position. The third lives in another process entirely: a command-line program that really gets launched.",
+    "The usual approach is one call path per kind of backend, with the branching written into the tool layer. Add a backend, add a branch, add one more place where cleanup can be missed.",
+    "Here the cost of plugging in a backend is squeezed down to four things: a name, a declaration of what it can do, a yes-or-no on whether it inherits the parent conversation, and a start action.",
+    "The start action hands back a handle — the child's id, a local object if there is one, a promise of a final result, and a teardown that must be called. All the differences between the three physical forms get compressed into those four things.",
+    "The fork case has one detail worth calling out on its own: the cut has to land exactly where a turn just finished. A turn in progress is unbalanced — a tool half-called, the result not back yet — and replaying a log like that doesn't produce a legal conversation at all.",
+    "The cross-process case doesn't even have a local object. Its id is freshly minted and has nothing to do with any local session.",
+    "**The caller doesn't need to know which kind of child it got. More to the point, it shouldn't.**"
+   ]
+  },
+  {
+   "heading": "A promise you can't keep, refused on the spot",
+   "body": [
+    "Once the interface is unified, the real trouble starts.",
+    "Four things only some backends can do: make the child emit its result in a given format, cap how many more levels it may delegate, trim which tools it can see, swap in a different persona.",
+    "The usual approach is best-effort — take the field, ignore it if you can't honor it. Very common in configuration systems, and genuinely less work.",
+    "The price is silent degradation. You asked for a structured result, you got back free-form text, the code treats it as structured data, and the error blows up a long way from the scene.",
+    "Here those four things become four switches, written into the backend's capability declaration. Before a request is handed to a backend they're compared one by one, and the first mismatch throws a \"not supported\" error. A request is never accepted and then ignored.",
+    "Every cross-process backend shares one frozen declaration, all four switches off. The reason is written right beside it: the child lives in someone else's process, and the parent has no way to enforce these constraints on its behalf.",
+    "There's a by-product I find rather nice. The tool description the model sees is also computed from that one bit — whether the parent conversation is inherited. The inheriting kind tells the model \"it has already seen every completed turn in this conversation, so say only what's new\"; the non-inheriting kind demands \"a complete, self-contained brief — it can't see a single word of this.\" The two wordings aren't written independently of each other.",
+    "**A promise you can't keep costs a thousand times less to break at startup than in the result.**"
+   ]
+  },
+  {
+   "heading": "\"Didn't get it done\" and \"broken\" are not the same thing",
+   "body": [
+    "The one-shot delegation flow is short in itself: post a message, wait for the child to go idle, read the result out of its session log, and then it must be destroyed.",
+    "What's worth watching here isn't the flow — it's the rules on the result channel.",
+    "The usual approach is a single promise: resolve on success, reject on failure. Child's model errored? Reject. Hit the token ceiling? Reject. Cancelled midway? Reject too.",
+    "The problem is that those \"failures\" and \"the framework itself broke\" are two completely different things, handled completely differently. Stuffing them into one channel is asking every call site to reinvent the distinction.",
+    "Here rejection is left for infrastructure faults and nothing else. The child's own failures fold into one of five stop reasons: finished, cancelled, errored, hit the token ceiling, refused the task.",
+    "A consumer maps that onto a tool error result with one branch table, and carries back whatever text the child had already produced along the way.",
+    "The cross-process backends also share one settlement move: first check whether local cancellation already won — if it did, report \"cancelled\" with the output collected so far; otherwise flatten the transport exception into \"errored\"; and whichever path it takes, unhook the cancellation listener at the end.",
+    "**Someone pays the cost of telling these apart: the framework once, or every call site separately.**"
+   ]
+  },
+  {
+   "heading": "It can go offline, but it can't lose its memory",
+   "body": [
+    "Everything above is one-shot work. There's another kind of child that sticks around — the parent gets a durable id and can push new work to it at any time, or interrupt the turn it's on.",
+    "This kind never goes through that one-shot start action, and never becomes a \"run\" at all. Later messages queue into its own inbox, first come first served.",
+    "The hard part is that sticking around can be interrupted. When the child isn't in memory, you have to be able to rebuild the whole thing off disk.",
+    "The usual approach is to serialize the entire options object it was created with. Less work — except half of that object is runtime references and the other half drifts with the version.",
+    "Here a descriptor record is appended at the head of every session-backed child: format version, mode, backend name, tags; the resident kind also records persona, tool filter, model and routing. Those fields are exactly the inputs a cold rebuild needs — not one more, not one fewer. Add a composition input and you must bump the version number.",
+    "That record goes only into the log. It doesn't enter model history, and compaction can't drop it — it isn't there for the model to read, it's there for recovery.",
+    "Recovery brings another headache: slicing the log. A resident child's current stint may have just been fished off disk, with the whole first half of the log belonging to the previous round. The observer records the log length at the start of the stint as a boundary, and at the end reads only the part past it to work out the stop reason and the final output.",
+    "One more rule I think is exactly right: a failed teardown overrides the stint's own conclusion and withholds the output. An answer that never made it to disk isn't an answer.",
+    "**Being recoverable depends on what recovery needs having been written down separately, not on \"it's all in the log anyway\".**"
+   ]
+  },
+  {
+   "heading": "The enemy of a recursion budget is the restart",
+   "body": [
+    "Delegation nests: a child can delegate again. So there has to be a recursion budget.",
+    "The place this number is most likely to go wrong isn't how it gets incremented — it's how it gets read.",
+    "The usual approach reads it from the runtime options. Sounds fine, until you remember that resident children come back from cold — back with a brand-new set of runtime options, counting from zero, so it thinks it's the top level and gets to unfold a whole delegation tree all over again.",
+    "**Put differently, the attack surface on a quantity like a recursion budget is never recursion. It's the restart.**",
+    "Here it's read as the larger of two sources: the one persisted in the session header, and the one in the runtime options. Both must be non-negative safe integers — even negative zero is explicitly rejected. The result is a number that can only be pushed deeper, never flattened.",
+    "Or push it one step further: assembly got made into the same shape. The child finishes all of its assembly inside the window before it's visible to anyone else — first join the parent's plugin composition (which decides which tools and which prompt sections it can see), then attach a fixed delegation brief, then the optional persona mask and tool restriction. Three steps collected in one place, with the parent as its input.",
+    "Which means the defect \"forgot to inherit the parent's composition\" can't even be expressed at the call site — and that's exactly the one to guard against: a child that never joined the composition sees an empty tool list.",
+    "Policy gets snapshotted on this boundary too: the parent session's explicit sandbox-mode override is captured synchronously before the first await, and the approval policy is pinned to \"never\". Both are written into the child's own log as \"source: delegation\", placed after the fork seed — so the new policy beats the old seed, and the child's own later switches beat both.",
+    "The synchronous capture deserves its own sentence: it guarantees that any policy change the parent makes afterward belongs to the parent's future, not to this child.",
+    "**A good constraint doesn't remind you not to forget. It makes the forgetting version impossible to write.**"
+   ]
+  },
+  {
+   "heading": "Let the model write the script, hand it six words",
+   "body": [
+    "Up to this point the orchestration logic is all human-written. One more step forward: let the model write the orchestration itself.",
+    "This sounds dangerous on its face. The usual approach is a restricted config format — a directed acyclic graph, nodes are tasks, edges are dependencies. Safe, but the expressive power is pitiful; any loop or condition past the trivial means adding a feature to the format.",
+    "The other extreme is handing over a full script runtime. Expressive enough, but now you've exposed the entire host to model-generated code.",
+    "What's on offer here is a real script, but the world that script can touch is six global names: start a child and wait for its result, run a set of no-argument functions concurrently, push each element through a chain of stage functions, two functions that broadcast progress, plus the initialization data the host passed in. The first five are frozen functions; the last has already been structured-cloned, so the script changing it can't reach the host.",
+    "One distinction inside the combinators matters: an ordinary throw only empties that one item's result and the script keeps going; a \"fatal\" error goes straight through the whole script. The test uses the host's own error type — defined outside the sandbox, so no object the script fakes gets past that parentage check.",
+    "So hitting a quota ceiling can't be disguised as \"one item failed\" and then run on, and a genuinely fatal error can't be swallowed into an empty value.",
+    "Before a value leaves the sandbox it has to be copied, layer by layer, into plain data: big integers, functions, symbols, non-finite numbers, cyclic references, sparse arrays, objects with a longer prototype chain than a plain object, symbol keys — all of them throw, with the path to the offender.",
+    "Quotas are layered: concurrent children per run (defaults to available cores minus two, capped at 16), total children a run may ever start (default 1000, and the comment flat-out calls it the backstop for a runaway loop), the element cap on a single concurrent call, and an execution timeout on the synchronous stretch at the top of the script.",
+    "After cancellation every hook call throws, not only the one that starts children — a script that caught a cancellation still can't use the broadcast functions to pretend it's alive. When something really is stuck on a promise nobody owns, the host's grace timer force-settles and terminates the whole thread, and that timer doesn't hold the process open.",
+    "Honestly, one thing has to be said here: the comment spells it out — the worker thread provides isolation of the host event loop and forced termination, not isolation from hostile values. While values are being copied out, getters in the script really do run.",
+    "**What it guards against is runaway, not malice. Those two get conflated constantly, and the cost of the confusion is usually paid by the second one.**"
+   ]
+  },
+  {
+   "heading": "Weld the loop shut, leave two knobs",
+   "body": [
+    "There's a plainer kind of orchestration: every round starts a brand-new child, and only a bounded, structured handoff crosses the round boundary. Last round's child is gone once it's done; the next round's child starts from the shared workspace and that short handoff.",
+    "The interesting part isn't the loop. It's how the loop is implemented.",
+    "The previous section just said the model can write orchestration scripts. So the natural move would be: have the model write a script that implements this loop.",
+    "It pointedly doesn't. That script is a constant string in the source. The model gets exactly two things to supply: the goal text, and a cap on the number of rounds. Loop shape, backend routing, the report format convention, the validation rules — it touches none of them.",
+    "The backend named in the config is checked at mount time: it must support structured output, and it must not inherit the parent conversation — if it inherits, it isn't a \"brand-new round\". A mismatch refuses to start, rather than surfacing on the first call.",
+    "The shape of each round's report is rigid: status (continue, done, blocked), summary, evidence, next step, blocking reason — and the statuses constrain each other: claiming done requires evidence, no next step, and an empty blocking reason. The script validates once; when the value comes back to the host it's parsed again under the same rules, including exact key-set equality and a serialized-length ceiling.",
+    "Put differently, that validation inside the script isn't treated as proof of trustworthiness.",
+    "The model-facing description carries an honest line too: done and blocked are both the worker's own report, not an independent assessment; the real long-term memory is the shared workspace and its current working tree, and the handoff is only a bounded hint — the next round is supposed to go check it against the workspace.",
+    "**The less that's variable, the fewer shapes an error can take. Sounds like a truism, and yet the overwhelming majority of orchestration frameworks run the other way.**"
+   ]
+  }
+ ],
+ "mechanisms": [
+  {
+   "name": "Check capabilities first; no match, no job",
+   "how": "The usual approach treats optional fields as best-effort: honor them if you can, ignore them if you can't, and the caller gets a result that looks fine. Here it's the other way around. A backend declares four switches when it registers — can it force structured output, can it cap recursion depth, can it trim tools, can it swap in a different persona. Before a request goes to a backend they're compared one by one, and the first mismatch throws a \"not supported\" error. Resident capability isn't expressed as a switch: it's whether the backend has the setup step at all, and if it doesn't, the refusal comes before any resource is reserved.",
+   "why": "It guards against silent degradation: you asked for structured output, got back free-form text, the code still treats it as structured data, and the error blows up a long way from the scene."
+  },
+  {
+   "name": "The recursion budget only goes deeper",
+   "how": "The usual approach reads recursion depth from the runtime options. The problem is on the recovery path: a resident child fished off disk comes back with a brand-new set of runtime options, counts from zero, decides it's the top level, and unfolds a whole delegation tree again. Here it's read as the larger of two sources — the one persisted in the session header, and the one in the runtime options. A child's depth is the parent's plus one, and exceeding the requested cap throws a dedicated error. Both sources must be non-negative safe integers; even negative zero is explicitly rejected.",
+   "why": "So that \"restart\" stops being the way around the recursion budget."
+  },
+  {
+   "name": "Fully assembled before it shows its face",
+   "how": "The usual approach creates the child first and then has the caller build it up step by step — add the plugin composition, add the brief, add the restrictions. Anything relying on discipline eventually gets a step skipped, and a child that skipped the plugin composition sees an empty tool list. Here all the assembly is collected in one place and done in a single pass, inside the window before the child is visible to anyone else: join the parent composition, attach the fixed delegation brief, add the optional persona mask and tool restriction. The parent is an input to that assembly, so \"forgot to inherit the parent's composition\" can't be expressed at the call site. The tool restriction governs both the list in the prompt and the refusal at execution time, and an unknown tool name errors at startup.",
+   "why": "It turns \"the thing you must not forget\" into \"the thing you can't write without\"."
+  },
+  {
+   "name": "Failure gets one door",
+   "how": "The usual approach makes one promise carry two kinds of failure: the child didn't get it done, and the framework itself broke. Mixed together, every call site has to tell them apart again. Here rejection is left for infrastructure faults, and the child's own failures fold into one of five stop reasons: finished, cancelled, errored, hit the token ceiling, refused the task. A consumer maps that onto a tool error result with one branch table, and carries back the text the child had already produced. Cross-process backends share one settlement move: first check whether local cancellation already won, otherwise flatten the transport exception into \"errored\", and whichever path it takes, unhook the cancellation listener at the end."
+  },
+  {
+   "name": "A record written only for recovery",
+   "how": "The usual approach serializes the whole options object from creation time and deserializes it back at recovery. The trouble is that half of that object is runtime references and the other half drifts with the version. Here a descriptor record is appended at the head of every session-backed child: format version, mode, backend name, tags, and for the resident kind also persona, tool filter, model and routing. It deliberately snapshots those explicit fields rather than the whole object, and adding a composition input means bumping the version number. The record goes only into the log — not into model history, not through compaction, and with no interface action attached.",
+   "why": "It gives recovery an explicit, versioned list of the inputs it needs, instead of leaving them scattered across a pile of runtime objects."
+  },
+  {
+   "name": "A script world of six words",
+   "how": "The usual approach is either a directed-acyclic-graph config format (safe, barely expressive) or a full runtime (expressive, host wide open). What's on offer here is a real script whose entire set of globals is six: start a child and wait for its result, run a set of no-argument functions concurrently, push elements through a chain of stage functions, two functions that broadcast progress, and one already structured-cloned piece of initialization data. Inside the combinators an ordinary throw only empties that item; a fatal error goes through the whole script. The test uses the host's own error type, defined outside the sandbox, so objects the script fakes don't get past that parentage check."
+  }
+ ],
+ "lessons": [
+  {
+   "lesson": "Make optional features into startup-time switches: if it isn't supported, refuse the request instead of accepting it and then ignoring it.",
+   "why": "The price of silent degradation is a caller holding a result that looks fine and is already wrong — you asked for structured output and got free-form text, and the error surfaces a long way from the scene. Declaring at startup has a second benefit: a config that doesn't match its backend is caught when the tool is mounted, not on the first real delegation."
+  },
+  {
+   "lesson": "Any counter that resets on recovery should be read as the larger of the persisted value and the runtime value.",
+   "why": "The attack surface on a quantity like a recursion budget is never recursion — it's the restart. Once \"start over\" can zero it, a deep child coming back from cold thinks it's the top level and unfolds a whole delegation tree again. Taking the maximum makes it monotonically deeper, and as a bonus the recovery path doesn't have to remember to pass the parameter correctly."
+  },
+  {
+   "lesson": "Let failure be expressed in one channel: the promise reserves rejection for infrastructure faults.",
+   "why": "If the child's model erroring also rejects, every call site has to work out for itself whether the child didn't get it done or the framework broke — and those two are handled completely differently. Folded into stop reasons, a consumer maps them onto a tool error result with one branch table, and can still carry back the text already produced."
+  },
+  {
+   "lesson": "Draw the trust boundary on the physical boundary: trust types in-process; validate across threads, across processes, and onto disk.",
+   "why": "An in-process backend is a collaborator held in place by static types, and another layer of runtime validation there is just noise. Model-written scripts, cross-thread messages and logs that landed on disk bring values the type system can guarantee nothing about, and layer-by-layer validation there is required. Draw the boundary the wrong way and you get either redundancy or a hole."
+  },
+  {
+   "lesson": "Weld the orchestration logic into the code and let the model feed it data only.",
+   "why": "That loop's shape, its backend routing and its report format are all source constants; the model supplies a goal and a round cap. The less that's variable, the fewer shapes an error can take. More important, the result is parsed again under the same rules once it's back on the host — the validation inside the script isn't treated as proof of trustworthiness."
+  }
+ ],
+ "tradeoffs": [
+  "Forked children can't be resident right now; there's a to-do sitting in the code. The reason is that a resident child's reporting tool and prompt section land ahead of the inherited history, which destroys exactly the prefix the fork wanted to reuse. Reopening that path requires the child's system prompt and tool descriptions to be byte-for-byte identical — not a small ask.",
+  "All four switches are off on cross-process backends. Out through an external command line, through someone else's agent, through a general protocol — structured output, tool trimming, per-child persona swaps and depth caps are all unavailable. Wanting any of them means coming back in-process. This is a real gap in capability, not a not-yet.",
+  "The worker thread is explicitly not a security boundary. The comment says it outright: what it provides is isolation of the host event loop and forced termination, not isolation from hostile values; while values are being copied out, getters in the script really do run. The whole design assumes model-written scripts are trusted but fallible.",
+  "The resident side is concentrated in one module of fourteen hundred–odd lines: id reservation, descriptor persistence, admission, the ownership graph, cold recovery, children-before-parent teardown, settlement delivery. The density of responsibility is very high, and any change has to face the whole pile.",
+  "Late-registration collisions on identical tool names are a known gap: two one-shot delegation instances configured with the same tool name collide when the backend shows up, and the duplicate-name throw also rolls back the registration. There's a to-do marked in the code, to be fixed once it shows up in a real composition.",
+  "That loop's \"done\" is the worker's own report, not an independent assessment. The host side validates the report's shape and length, not whether the things it claims to have done actually happened. That's honest as a design, but it also means the loop itself offers no correctness guarantee."
+ ],
+ "codeIndex": [
+  {
+   "path": "packages/subagent/subagent/src/types.ts",
+   "note": "the provider contract, the four capability booleans, the run handle and result types"
+  },
+  {
+   "path": "packages/subagent/subagent/src/index.ts",
+   "note": "the provider registry and the entry point for startup-time capability checks"
+  },
+  {
+   "path": "packages/subagent/subagent/src/depth.ts",
+   "note": "the monotonic lower-bound read and validation of delegation depth"
+  },
+  {
+   "path": "packages/subagent/subagent/src/child-agent.ts",
+   "note": "child assembly, depth resolution, and delegation policy capture"
+  },
+  {
+   "path": "packages/subagent/subagent/src/continuation.ts",
+   "note": "resumable children: id reservation, cold recovery, resident admission, ownership, and settlement delivery (1483 lines)"
+  },
+  {
+   "path": "packages/subagent/subagent-in-process-driver/src/index.ts",
+   "note": "the shared driver for in-process one-shot runs and reading the result back out"
+  },
+  {
+   "path": "packages/subagent/subagent-claude-code/src/run.ts",
+   "note": "launching the external CLI subprocess, the strict success test, and teardown"
+  },
+  {
+   "path": "packages/workflow/workflow-worker-thread/src/runtime.ts",
+   "note": "the six sandbox globals, the combinators, fatality detection, and cross-realm value materialization"
+  }
+ ],
+ "related": [
+  "agent",
+  "agent-loop",
+  "session",
+  "tools"
+ ]
+}
