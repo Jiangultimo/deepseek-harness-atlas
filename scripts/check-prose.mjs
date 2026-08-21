@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * 正文体检：这批档案的硬约束是「正文里不出现代码痕迹」，
- * 靠人眼扫 22 份 9 万字不现实，所以让机器扫。
+ * 靠人眼扫两个语种几十万字不现实，所以让机器扫。
  *
  * 只检查会渲染成正文的字段（lede / sections / mechanisms / lessons / tradeoffs），
  * codeIndex 和 packages 本来就是放路径的，跳过。
@@ -10,6 +10,12 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 
 const dir = join(import.meta.dirname, '..', 'src', 'content', 'archives')
+
+/** 档案按语种分目录存放，两个语种都要扫——代码痕迹这条约束不分语言。 */
+const locales = readdirSync(dir, { withFileTypes: true })
+  .filter((e) => e.isDirectory())
+  .map((e) => e.name)
+  .sort()
 
 /** 代码痕迹的特征，按严重程度排序 */
 const SMELLS = [
@@ -27,6 +33,7 @@ const SMELLS = [
 const ALLOW = new Set([
   'JavaScript', 'TypeScript', 'GitHub', 'JSON', 'YAML', 'DeepSeek',
   'iOS', 'macOS', 'npm', 'pnpm', 'AGENTS', 'README',
+  'microVMs',
 ])
 
 function proseOf(a) {
@@ -56,8 +63,12 @@ let totalHits = 0
 let totalChars = 0
 const report = []
 
-for (const file of readdirSync(dir).filter((f) => f.endsWith('.json')).sort()) {
-  const a = JSON.parse(readFileSync(join(dir, file), 'utf8'))
+let scanned = 0
+
+for (const locale of locales) {
+for (const file of readdirSync(join(dir, locale)).filter((f) => f.endsWith('.json')).sort()) {
+  scanned++
+  const a = JSON.parse(readFileSync(join(dir, locale, file), 'utf8'))
   const prose = proseOf(a)
   if (prose.length === 0) continue
 
@@ -76,26 +87,35 @@ for (const file of readdirSync(dir).filter((f) => f.endsWith('.json')).sort()) {
   totalHits += hits.length
 
   // 风格正向指标
-  const bold = (a.lede + prose.map(([, t]) => t).join('')).match(/\*\*[^*]+\*\*/g)?.length ?? 0
-  const contrast = prose.filter(([, t]) => /不是.{1,30}而是/.test(t)).length
+  // 这两项衡量的是中文行文习惯，对译文没有意义，只在中文档案上算。
+  const zh = locale === 'zh'
+  const bold = zh ? ((a.lede + prose.map(([, t]) => t).join('')).match(/\*\*[^*]+\*\*/g)?.length ?? 0) : null
+  const contrast = zh ? prose.filter(([, t]) => /不是.{1,30}而是/.test(t)).length : null
 
-  report.push({ file: file.replace('.json', ''), chars, hits, bold, contrast })
+  report.push({ file: `${locale}/${file.replace('.json', '')}`, chars, hits, bold, contrast })
+}
 }
 
-console.log('块'.padEnd(20), '正文字数'.padStart(8), '加粗'.padStart(5), '「不是…而是」'.padStart(10), '代码痕迹'.padStart(8))
-console.log('-'.repeat(62))
+// 扫不到东西要当场喊出来。归档目录挪过一次位置，那之后这道闸门一直在检查空集然后报成功。
+if (scanned === 0) {
+  console.error(`没有扫到任何档案：${dir} 下没有语种子目录，或子目录里没有 .json。`)
+  process.exit(1)
+}
+
+console.log('块'.padEnd(26), '正文字数'.padStart(8), '加粗'.padStart(5), '「不是…而是」'.padStart(10), '代码痕迹'.padStart(8))
+console.log('-'.repeat(68))
 for (const r of report) {
   const flag = r.hits.length > 0 ? String(r.hits.length) : '·'
   console.log(
-    r.file.padEnd(20),
+    r.file.padEnd(26),
     String(r.chars).padStart(8),
-    String(r.bold).padStart(5),
-    String(r.contrast).padStart(10),
+    (r.bold ?? '·').toString().padStart(5),
+    (r.contrast ?? '·').toString().padStart(10),
     flag.padStart(8),
   )
 }
-console.log('-'.repeat(62))
-console.log(`合计正文 ${totalChars.toLocaleString()} 字，代码痕迹 ${totalHits} 处`)
+console.log('-'.repeat(68))
+console.log(`${scanned} 份档案，合计正文 ${totalChars.toLocaleString()} 字，代码痕迹 ${totalHits} 处`)
 
 if (totalHits > 0) {
   console.log('\n=== 需要处理的痕迹 ===')
